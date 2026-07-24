@@ -1,0 +1,17 @@
+# Binaries
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+examples/example
+examples/**/example
+examples/*/main
+/bin/
+
+# Coverage
+*.out
+
+# IDE / OS
+.DS_Store
+.idea/
