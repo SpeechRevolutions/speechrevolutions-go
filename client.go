@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -35,7 +36,15 @@ type Client struct {
 	BaseURL string
 	Timeout time.Duration
 	HTTP    *http.Client
+	// Multipart prefers S3 multipart uploads and falls back to a single presigned
+	// PUT if the server has multipart disabled or a multipart upload fails
+	// mid-flight. Defaults to true (set by NewClient).
+	Multipart bool
 }
+
+// errMultipartUnavailable signals that a multipart upload should fall back to
+// the single-shot path (server has multipart disabled, or a mid-flight failure).
+var errMultipartUnavailable = errors.New("multipart unavailable")
 
 // NewClient creates a Client. If apiKey is empty, reads
 // SPEECHREVOLUTIONS_API_KEY or STT_API_KEY from the environment.
@@ -50,10 +59,11 @@ func NewClient(apiKey string) (*Client, error) {
 		return nil, authErr("api_key is required (pass apiKey or set SPEECHREVOLUTIONS_API_KEY / STT_API_KEY)")
 	}
 	return &Client{
-		APIKey:  apiKey,
-		BaseURL: defaultBaseURL,
-		Timeout: 600 * time.Second,
-		HTTP:    &http.Client{},
+		APIKey:    apiKey,
+		BaseURL:   defaultBaseURL,
+		Timeout:   600 * time.Second,
+		HTTP:      &http.Client{},
+		Multipart: true,
 	}, nil
 }
 
@@ -99,31 +109,22 @@ func (c *Client) TranscribeBytes(data []byte, opts TranscribeOptions, onProgress
 	}
 	opts = opts.withDefaults()
 
-	job, err := c.CreateUploadJob(len(data), opts)
-	if err != nil {
-		return nil, err
-	}
-
 	// Upload phase: byte-level progress -> optional callback + optional bar.
 	uploadCb, uploadBar := resolveProgress(opts.OnUploadProgress, opts.Progress, "Uploading", true)
-	err = c.uploadAudio(job.UploadURL, data, job.JobID, byteProgressAdapter(uploadCb))
+	jobID, jobDownloadURL, err := c.ingestUpload(data, opts, byteProgressAdapter(uploadCb))
 	uploadBar.close()
 	if err != nil {
 		return nil, err
 	}
 
-	if err := c.CompleteUpload(job.JobID); err != nil {
-		return nil, err
-	}
-
 	// Transcription phase: SSE progress -> optional callback + optional bar.
 	progressCb, bar := resolveProgress(onProgress, opts.Progress, "Transcribing", false)
-	content, downloadURL, err := c.WaitForResult(job.JobID, job.DownloadURL, progressCb)
+	content, downloadURL, err := c.WaitForResult(jobID, jobDownloadURL, progressCb)
 	bar.close()
 	if err != nil {
 		return nil, err
 	}
-	return parseTranscript(job.JobID, content, opts.OutputType, downloadURL), nil
+	return parseTranscript(jobID, content, opts.OutputType, downloadURL), nil
 }
 
 // Submit uploads and enqueues a job, returning its job_id WITHOUT waiting for
@@ -160,20 +161,13 @@ func (c *Client) SubmitBytes(data []byte, opts TranscribeOptions) (string, error
 	}
 	opts = opts.withDefaults()
 
-	job, err := c.CreateUploadJob(len(data), opts)
-	if err != nil {
-		return "", err
-	}
 	uploadCb, uploadBar := resolveProgress(opts.OnUploadProgress, opts.Progress, "Uploading", true)
-	err = c.uploadAudio(job.UploadURL, data, job.JobID, byteProgressAdapter(uploadCb))
+	jobID, _, err := c.ingestUpload(data, opts, byteProgressAdapter(uploadCb))
 	uploadBar.close()
 	if err != nil {
 		return "", err
 	}
-	if err := c.CompleteUpload(job.JobID); err != nil {
-		return "", err
-	}
-	return job.JobID, nil
+	return jobID, nil
 }
 
 type uploadRequest struct {
@@ -193,6 +187,132 @@ type uploadResponse struct {
 	DownloadURL string          `json:"download_url"`
 	ContentType string          `json:"content_type"`
 	ExpiresIn   int             `json:"expires_in"`
+}
+
+type multipartCreateResponse struct {
+	JobID       string `json:"job_id"`
+	UploadID    string `json:"upload_id"`
+	DownloadURL string `json:"download_url"`
+	PartSize    int    `json:"part_size"`
+	NumParts    int    `json:"num_parts"`
+	Parts       []struct {
+		PartNumber int    `json:"part_number"`
+		URL        string `json:"url"`
+	} `json:"parts"`
+}
+
+type completedPart struct {
+	PartNumber int    `json:"part_number"`
+	ETag       string `json:"etag"`
+}
+
+// ingestUpload gets audio into the platform and returns (jobID, downloadURL).
+// It prefers a multipart upload (when Multipart is set) and falls back to a
+// single presigned PUT if the server has multipart disabled or a multipart
+// upload fails mid-flight.
+func (c *Client) ingestUpload(data []byte, opts TranscribeOptions, byteCb func(sent, total int)) (string, string, error) {
+	if c.Multipart {
+		jobID, downloadURL, err := c.uploadMultipart(data, opts, byteCb)
+		if err == nil {
+			return jobID, downloadURL, nil
+		}
+		if !errors.Is(err, errMultipartUnavailable) {
+			return "", "", err
+		}
+		// multipart unavailable — fall through to the single-shot path
+	}
+	job, err := c.CreateUploadJob(len(data), opts)
+	if err != nil {
+		return "", "", err
+	}
+	if err := c.uploadAudio(job.UploadURL, data, job.JobID, byteCb); err != nil {
+		return "", "", err
+	}
+	if err := c.CompleteUpload(job.JobID); err != nil {
+		return "", "", err
+	}
+	return job.JobID, job.DownloadURL, nil
+}
+
+// uploadMultipart runs the S3 multipart flow: create -> PUT each part ->
+// complete. It returns an error wrapping errMultipartUnavailable when the
+// server has multipart disabled (404) or a mid-flight failure means we should
+// retry via the single-shot path. Other errors (e.g. create 5xx) propagate.
+func (c *Client) uploadMultipart(data []byte, opts TranscribeOptions, byteCb func(sent, total int)) (string, string, error) {
+	opts = opts.withDefaults()
+	body := uploadRequest{
+		FileSize:         len(data),
+		OutputType:       string(opts.OutputType),
+		WordTimestamps:   *opts.WordTimestamps,
+		SpeakerLabels:    *opts.SpeakerLabels,
+		NLTK:             *opts.NLTK,
+		Tier:             string(*opts.Tier),
+		CustomVocabulary: opts.CustomVocabulary,
+		CallbackURL:      opts.CallbackURL,
+	}
+	var created multipartCreateResponse
+	if err := c.apiRequest("POST", "/api/v1/upload/multipart/create", body, &created); err != nil {
+		var nf *JobNotFoundError
+		if errors.As(err, &nf) { // route returns 404 when multipart is disabled
+			return "", "", fmt.Errorf("multipart disabled: %w", errMultipartUnavailable)
+		}
+		return "", "", err
+	}
+
+	completed := make([]completedPart, 0, len(created.Parts))
+	uploaded := 0
+	for _, p := range created.Parts {
+		start := (p.PartNumber - 1) * created.PartSize
+		end := start + created.PartSize
+		if end > len(data) {
+			end = len(data)
+		}
+		etag, err := c.putPart(p.URL, data[start:end])
+		if err != nil {
+			c.abortMultipart(created.JobID)
+			return "", "", fmt.Errorf("multipart part upload failed: %w", errMultipartUnavailable)
+		}
+		completed = append(completed, completedPart{PartNumber: p.PartNumber, ETag: etag})
+		uploaded += end - start
+		if byteCb != nil {
+			byteCb(uploaded, len(data))
+		}
+	}
+
+	if err := c.apiRequest("POST", "/api/v1/upload/multipart/complete",
+		map[string]any{"job_id": created.JobID, "parts": completed}, nil); err != nil {
+		c.abortMultipart(created.JobID)
+		return "", "", fmt.Errorf("multipart complete failed: %w", errMultipartUnavailable)
+	}
+	return created.JobID, created.DownloadURL, nil
+}
+
+// putPart PUTs one part to its presigned URL and returns the S3 ETag.
+func (c *Client) putPart(rawURL string, chunk []byte) (string, error) {
+	req, err := http.NewRequest("PUT", rawURL, bytes.NewReader(chunk))
+	if err != nil {
+		return "", err
+	}
+	req.ContentLength = int64(len(chunk))
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode != 200 && resp.StatusCode != 204 {
+		return "", uploadErr(fmt.Sprintf("part upload failed (HTTP %d)", resp.StatusCode))
+	}
+	etag := resp.Header.Get("ETag") // http.Header.Get is case-insensitive
+	if etag == "" {
+		return "", uploadErr("part upload response missing ETag header")
+	}
+	return etag, nil
+}
+
+// abortMultipart best-effort discards an in-progress multipart upload.
+func (c *Client) abortMultipart(jobID string) {
+	_ = c.apiRequest("POST", "/api/v1/upload/multipart/abort", map[string]string{"job_id": jobID}, nil)
 }
 
 // CreateUploadJob calls POST /api/v1/upload.
