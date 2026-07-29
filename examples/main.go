@@ -5,6 +5,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 
@@ -36,6 +37,7 @@ func main() {
 	tier := stt.TierStandard
 
 	result, err := client.Transcribe(
+		context.Background(),
 		"audio.mp3",
 		stt.TranscribeOptions{
 			OutputType:       stt.OutputJSON,

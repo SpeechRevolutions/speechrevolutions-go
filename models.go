@@ -76,16 +76,10 @@ func (o TranscribeOptions) withDefaults() TranscribeOptions {
 // UploadJob is the result of POST /api/v1/upload.
 type UploadJob struct {
 	JobID       string
-	UploadURL   any // string or PresignedPost
+	UploadURL   string
 	DownloadURL string
 	ContentType string
 	ExpiresIn   int
-}
-
-// PresignedPost represents a multipart form upload target.
-type PresignedPost struct {
-	URL    string            `json:"url"`
-	Fields map[string]string `json:"fields"`
 }
 
 // ProgressEvent is a single progress update.
@@ -285,10 +279,71 @@ func parseTranscript(jobID string, content []byte, outputType OutputType, downlo
 	t.Raw = raw
 	words := parseWords(raw["words"])
 	t.Words = words
-	t.Utterances = utterancesFromWords(words)
+	t.Utterances = utterancesFromDiarization(words, raw["diarization"])
 	t.Languages = parseLanguageSegments(raw["languages"])
 	t.text = joinWords(words)
 	return t
+}
+
+// utterancesFromDiarization prefers the server's diarization segments, which
+// separate turns the speaker labels alone cannot (the same speaker talking
+// twice). Falls back to grouping consecutive words by speaker.
+func utterancesFromDiarization(words []Word, v any) []Utterance {
+	arr, ok := v.([]any)
+	if !ok || len(arr) == 0 {
+		return utterancesFromWords(words)
+	}
+
+	out := make([]Utterance, 0, len(arr))
+	for _, item := range arr {
+		m, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		start, end := asFloatPtr(m["start"]), asFloatPtr(m["end"])
+		if start == nil || end == nil {
+			continue
+		}
+		segWords := wordsWithin(words, *start, *end)
+		out = append(out, Utterance{
+			Text:    joinWords(segWords),
+			Speaker: asString(m["speaker"]),
+			Start:   start,
+			End:     end,
+			Words:   segWords,
+		})
+	}
+	if len(out) == 0 {
+		return utterancesFromWords(words)
+	}
+	return out
+}
+
+// wordsWithin collects the words a segment covers, falling back to a midpoint
+// test for words that straddle the boundary.
+func wordsWithin(words []Word, start, end float64) []Word {
+	const eps = 1e-3
+	var inside []Word
+	for _, w := range words {
+		if w.Start == nil || w.End == nil {
+			continue
+		}
+		if *w.Start >= start-eps && *w.End <= end+eps {
+			inside = append(inside, w)
+		}
+	}
+	if len(inside) > 0 {
+		return inside
+	}
+	for _, w := range words {
+		if w.Start == nil || w.End == nil {
+			continue
+		}
+		if mid := (*w.Start + *w.End) / 2; mid >= start && mid <= end {
+			inside = append(inside, w)
+		}
+	}
+	return inside
 }
 
 func parseWords(v any) []Word {

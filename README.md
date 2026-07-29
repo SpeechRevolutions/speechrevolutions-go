@@ -16,9 +16,10 @@ import stt "github.com/speechrevolutions/go-sdk"
 
 ```go
 client, _ := stt.NewClient("") // SPEECHREVOLUTIONS_API_KEY or STT_API_KEY
+ctx := context.Background()
 
 sl := true
-result, err := client.Transcribe("meeting.mp3", stt.TranscribeOptions{
+result, err := client.Transcribe(ctx, "meeting.mp3", stt.TranscribeOptions{
     SpeakerLabels: &sl,
 }, nil)
 if err != nil {
@@ -31,16 +32,23 @@ for _, u := range result.Utterances {
 }
 ```
 
-`Transcribe` accepts a local file path, an `http(s)` URL, or raw bytes
-(`TranscribeBytes`). The third argument is an optional transcription-progress
+Every call takes a `context.Context` first, so you can cancel or deadline any
+request. `Transcribe` accepts a local file path, an `http(s)` URL, or raw bytes
+(`TranscribeBytes`). The last argument is an optional transcription-progress
 callback (`nil` for none).
 
 ### From a URL (Deepgram-style)
 
 ```go
-result, err := client.TranscribeURL("https://example.com/audio.mp3", stt.TranscribeOptions{}, nil)
+result, err := client.TranscribeURL(ctx, "https://example.com/audio.mp3", stt.TranscribeOptions{}, nil)
 // or, since Transcribe detects http(s):
-result, err := client.Transcribe("https://example.com/audio.mp3", stt.TranscribeOptions{}, nil)
+result, err := client.Transcribe(ctx, "https://example.com/audio.mp3", stt.TranscribeOptions{}, nil)
+```
+
+The platform fetches the URL itself — the audio never passes through this
+process.
+
+```go
 ```
 
 `TranscribeFile` is the same for a local path.
@@ -75,7 +83,7 @@ render *and* your callbacks fire for every event.
 // 1. Console bars — a single line on stderr, updated in place. Shows an
 //    "Uploading" byte bar, then a "Transcribing" bar. Off by default.
 sl := true
-result, _ := client.Transcribe("meeting.mp3", stt.TranscribeOptions{
+result, _ := client.Transcribe(ctx, "meeting.mp3", stt.TranscribeOptions{
     SpeakerLabels: &sl,
     Progress:      true,
 }, nil)
@@ -92,7 +100,7 @@ onUpload := func(e stt.ProgressEvent) { // upload (e.Step == "upload")
     }
 }
 
-result, _ = client.Transcribe("meeting.mp3", stt.TranscribeOptions{
+result, _ = client.Transcribe(ctx, "meeting.mp3", stt.TranscribeOptions{
     OnUploadProgress: onUpload,
 }, onProgress)
 ```
@@ -108,15 +116,15 @@ ideal for batch/background work. Collect the result later via a webhook
 body) or by polling. See `examples/retrieve`:
 
 ```go
-jobID, _ := client.Submit("meeting.mp3", stt.TranscribeOptions{}) // returns immediately
+jobID, _ := client.Submit(ctx, "meeting.mp3", stt.TranscribeOptions{}) // returns immediately
 // ...or notify a webhook instead of polling:
-client.Transcribe(path, stt.TranscribeOptions{CallbackURL: "https://you.example.com/hook"}, nil)
+client.Transcribe(ctx, path, stt.TranscribeOptions{CallbackURL: "https://you.example.com/hook"}, nil)
 
-st, _ := client.GetJobStatus(jobID)          // st.Status: processing|completed|failed
+st, _ := client.GetJobStatus(ctx, jobID)     // st.Status: processing|completed|failed
 if st.IsCompleted() {
-    result, _ := client.GetTranscript(jobID, stt.OutputJSON) // downloads + parses
+    result, _ := client.GetTranscript(ctx, jobID, stt.OutputJSON) // downloads + parses
 }
-page, _ := client.ListJobs(50, "")           // page.Jobs, page.NextBefore
+page, _ := client.ListJobs(ctx, 50, "")      // page.Jobs, page.NextBefore
 ```
 
 ## Result shape
@@ -141,6 +149,28 @@ fmt.Println(chans[0]["alternatives"].([]map[string]any)[0]["transcript"])
 // Save writes output.<output_type> when the path has no extension.
 out, _ := result.Save("output") // -> "output.json"
 fmt.Println("saved to", out)
+```
+
+## Timeouts and retries
+
+Every method takes a `context.Context`, so cancelling or deadlining a call is
+the caller's choice:
+
+```go
+ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+defer cancel()
+result, err := client.Transcribe(ctx, "meeting.mp3", stt.TranscribeOptions{}, nil)
+```
+
+JSON API requests that fail to connect or return 429/500/502/503/504 are retried
+with exponential backoff, honoring `Retry-After`. Uploads and the progress
+stream have their own retry loops.
+
+```go
+client.Timeout = 10 * time.Minute // whole-job wait (SSE + polling)
+client.MaxRetries = 3             // extra attempts per API request
+client.RetryBackoff = 500 * time.Millisecond
+client.HTTP = &http.Client{Transport: myTransport} // proxies, tracing, etc.
 ```
 
 ## Auth

@@ -3,13 +3,13 @@ package stt
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"mime/multipart"
+	"math"
 	"net/http"
-	"net/textproto"
 	"net/url"
 	"os"
 	"strconv"
@@ -28,18 +28,37 @@ const (
 	sseMaxReconnects  = 10
 	sseReconnectDelay = 3 * time.Second
 	pollInterval      = 5 * time.Second
+
+	// Per-request deadlines, applied on top of the caller's context.
+	apiTimeout      = 30 * time.Second
+	downloadTimeout = 60 * time.Second
+	uploadTimeout   = 300 * time.Second
+
+	defaultMaxRetries   = 3
+	defaultRetryBackoff = 500 * time.Millisecond
+	retryBackoffMax     = 30 * time.Second
 )
+
+// Statuses worth a second attempt on a JSON API request.
+var retryStatusCodes = map[int]bool{429: true, 500: true, 502: true, 503: true, 504: true}
 
 // Client talks to the Speech Revolutions STT API.
 type Client struct {
 	APIKey  string
 	BaseURL string
+	// Timeout bounds a whole transcription wait (SSE + polling). Individual
+	// HTTP calls have their own shorter deadlines.
 	Timeout time.Duration
 	HTTP    *http.Client
 	// Multipart prefers S3 multipart uploads and falls back to a single presigned
 	// PUT if the server has multipart disabled or a multipart upload fails
 	// mid-flight. Defaults to true (set by NewClient).
 	Multipart bool
+	// MaxRetries is the number of extra attempts for a JSON API request that
+	// fails to connect or returns 429/5xx. Uploads and SSE have their own loops.
+	MaxRetries int
+	// RetryBackoff is the first retry delay; it doubles per attempt, capped at 30s.
+	RetryBackoff time.Duration
 }
 
 // errMultipartUnavailable signals that a multipart upload should fall back to
@@ -59,67 +78,66 @@ func NewClient(apiKey string) (*Client, error) {
 		return nil, authErr("api_key is required (pass apiKey or set SPEECHREVOLUTIONS_API_KEY / STT_API_KEY)")
 	}
 	return &Client{
-		APIKey:    apiKey,
-		BaseURL:   defaultBaseURL,
-		Timeout:   600 * time.Second,
-		HTTP:      &http.Client{},
-		Multipart: true,
+		APIKey:       apiKey,
+		BaseURL:      defaultBaseURL,
+		Timeout:      600 * time.Second,
+		HTTP:         &http.Client{},
+		Multipart:    true,
+		MaxRetries:   defaultMaxRetries,
+		RetryBackoff: defaultRetryBackoff,
 	}, nil
 }
 
 // Transcribe uploads audio, waits for completion, and returns a Transcript.
-// audioPath may be a local filesystem path or an http(s) URL.
-func (c *Client) Transcribe(audioPath string, opts TranscribeOptions, onProgress ProgressFunc) (*Transcript, error) {
-	if strings.HasPrefix(audioPath, "http://") || strings.HasPrefix(audioPath, "https://") {
-		return c.TranscribeURL(audioPath, opts, onProgress)
+// audioPath may be a local filesystem path or an http(s) URL; a URL is handed
+// to the platform to fetch, so nothing is uploaded from here.
+func (c *Client) Transcribe(ctx context.Context, audioPath string, opts TranscribeOptions, onProgress ProgressFunc) (*Transcript, error) {
+	if isURL(audioPath) {
+		return c.TranscribeURL(ctx, audioPath, opts, onProgress)
 	}
 	data, err := os.ReadFile(audioPath)
 	if err != nil {
 		return nil, err
 	}
-	return c.TranscribeBytes(data, opts, onProgress)
+	return c.TranscribeBytes(ctx, data, opts, onProgress)
 }
 
-// TranscribeURL downloads remote audio then transcribes it.
-func (c *Client) TranscribeURL(url string, opts TranscribeOptions, onProgress ProgressFunc) (*Transcript, error) {
-	resp, err := c.HTTP.Get(url)
-	if err != nil {
-		return nil, apiErr(fmt.Sprintf("Failed to download audio URL: %v", err), 0, "")
-	}
-	defer resp.Body.Close()
-	data, err := io.ReadAll(resp.Body)
+// TranscribeURL transcribes audio the platform fetches from a public http(s)
+// URL, then waits for the result.
+func (c *Client) TranscribeURL(ctx context.Context, audioURL string, opts TranscribeOptions, onProgress ProgressFunc) (*Transcript, error) {
+	opts = opts.withDefaults()
+	jobID, jobDownloadURL, err := c.submitURL(ctx, audioURL, opts)
 	if err != nil {
 		return nil, err
 	}
-	if resp.StatusCode != 200 {
-		return nil, apiErr(fmt.Sprintf("Failed to download audio URL (HTTP %d)", resp.StatusCode), resp.StatusCode, truncate(string(data), 300))
-	}
-	return c.TranscribeBytes(data, opts, onProgress)
+	return c.awaitTranscript(ctx, jobID, jobDownloadURL, opts, onProgress)
 }
 
 // TranscribeFile is an alias for Transcribe with a local path.
-func (c *Client) TranscribeFile(path string, opts TranscribeOptions, onProgress ProgressFunc) (*Transcript, error) {
-	return c.Transcribe(path, opts, onProgress)
+func (c *Client) TranscribeFile(ctx context.Context, path string, opts TranscribeOptions, onProgress ProgressFunc) (*Transcript, error) {
+	return c.Transcribe(ctx, path, opts, onProgress)
 }
 
 // TranscribeBytes is like Transcribe but accepts raw audio bytes.
-func (c *Client) TranscribeBytes(data []byte, opts TranscribeOptions, onProgress ProgressFunc) (*Transcript, error) {
+func (c *Client) TranscribeBytes(ctx context.Context, data []byte, opts TranscribeOptions, onProgress ProgressFunc) (*Transcript, error) {
 	if len(data) == 0 {
 		return nil, fmt.Errorf("audio is empty")
 	}
 	opts = opts.withDefaults()
 
-	// Upload phase: byte-level progress -> optional callback + optional bar.
 	uploadCb, uploadBar := resolveProgress(opts.OnUploadProgress, opts.Progress, "Uploading", true)
-	jobID, jobDownloadURL, err := c.ingestUpload(data, opts, byteProgressAdapter(uploadCb))
+	jobID, jobDownloadURL, err := c.ingestUpload(ctx, data, opts, byteProgressAdapter(uploadCb))
 	uploadBar.close()
 	if err != nil {
 		return nil, err
 	}
+	return c.awaitTranscript(ctx, jobID, jobDownloadURL, opts, onProgress)
+}
 
-	// Transcription phase: SSE progress -> optional callback + optional bar.
+// awaitTranscript waits out the transcription phase and parses the result.
+func (c *Client) awaitTranscript(ctx context.Context, jobID, jobDownloadURL string, opts TranscribeOptions, onProgress ProgressFunc) (*Transcript, error) {
 	progressCb, bar := resolveProgress(onProgress, opts.Progress, "Transcribing", false)
-	content, downloadURL, err := c.WaitForResult(jobID, jobDownloadURL, progressCb)
+	content, downloadURL, err := c.WaitForResult(ctx, jobID, jobDownloadURL, progressCb)
 	bar.close()
 	if err != nil {
 		return nil, err
@@ -131,38 +149,32 @@ func (c *Client) TranscribeBytes(data []byte, opts TranscribeOptions, onProgress
 // the result. Collect it later via a webhook (opts.CallbackURL) or by polling
 // GetJobStatus / GetTranscript. Ideal for batch workloads. audioPath may be a
 // local path or an http(s) URL.
-func (c *Client) Submit(audioPath string, opts TranscribeOptions) (string, error) {
-	if strings.HasPrefix(audioPath, "http://") || strings.HasPrefix(audioPath, "https://") {
-		resp, err := c.HTTP.Get(audioPath)
-		if err != nil {
-			return "", apiErr(fmt.Sprintf("Failed to download audio URL: %v", err), 0, "")
-		}
-		defer resp.Body.Close()
-		data, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return "", err
-		}
-		if resp.StatusCode != 200 {
-			return "", apiErr(fmt.Sprintf("Failed to download audio URL (HTTP %d)", resp.StatusCode), resp.StatusCode, truncate(string(data), 300))
-		}
-		return c.SubmitBytes(data, opts)
+func (c *Client) Submit(ctx context.Context, audioPath string, opts TranscribeOptions) (string, error) {
+	if isURL(audioPath) {
+		return c.SubmitURL(ctx, audioPath, opts)
 	}
 	data, err := os.ReadFile(audioPath)
 	if err != nil {
 		return "", err
 	}
-	return c.SubmitBytes(data, opts)
+	return c.SubmitBytes(ctx, data, opts)
+}
+
+// SubmitURL enqueues audio the platform fetches from a public http(s) URL.
+func (c *Client) SubmitURL(ctx context.Context, audioURL string, opts TranscribeOptions) (string, error) {
+	jobID, _, err := c.submitURL(ctx, audioURL, opts.withDefaults())
+	return jobID, err
 }
 
 // SubmitBytes is like Submit but accepts raw audio bytes.
-func (c *Client) SubmitBytes(data []byte, opts TranscribeOptions) (string, error) {
+func (c *Client) SubmitBytes(ctx context.Context, data []byte, opts TranscribeOptions) (string, error) {
 	if len(data) == 0 {
 		return "", fmt.Errorf("audio is empty")
 	}
 	opts = opts.withDefaults()
 
 	uploadCb, uploadBar := resolveProgress(opts.OnUploadProgress, opts.Progress, "Uploading", true)
-	jobID, _, err := c.ingestUpload(data, opts, byteProgressAdapter(uploadCb))
+	jobID, _, err := c.ingestUpload(ctx, data, opts, byteProgressAdapter(uploadCb))
 	uploadBar.close()
 	if err != nil {
 		return "", err
@@ -171,7 +183,8 @@ func (c *Client) SubmitBytes(data []byte, opts TranscribeOptions) (string, error
 }
 
 type uploadRequest struct {
-	FileSize         int      `json:"file_size"`
+	FileSize         int      `json:"file_size,omitempty"`
+	AudioURL         string   `json:"audio_url,omitempty"`
 	OutputType       string   `json:"output_type"`
 	WordTimestamps   bool     `json:"word_timestamps"`
 	SpeakerLabels    bool     `json:"speaker_labels"`
@@ -182,11 +195,11 @@ type uploadRequest struct {
 }
 
 type uploadResponse struct {
-	JobID       string          `json:"job_id"`
-	UploadURL   json.RawMessage `json:"upload_url"`
-	DownloadURL string          `json:"download_url"`
-	ContentType string          `json:"content_type"`
-	ExpiresIn   int             `json:"expires_in"`
+	JobID       string `json:"job_id"`
+	UploadURL   string `json:"upload_url"`
+	DownloadURL string `json:"download_url"`
+	ContentType string `json:"content_type"`
+	ExpiresIn   int    `json:"expires_in"`
 }
 
 type multipartCreateResponse struct {
@@ -201,18 +214,41 @@ type multipartCreateResponse struct {
 	} `json:"parts"`
 }
 
-type completedPart struct {
-	PartNumber int    `json:"part_number"`
-	ETag       string `json:"etag"`
+// uploadBody is the JSON shared by the single-shot and multipart create endpoints.
+func uploadBody(fileSize int, opts TranscribeOptions) uploadRequest {
+	opts = opts.withDefaults()
+	return uploadRequest{
+		FileSize:         fileSize,
+		OutputType:       string(opts.OutputType),
+		WordTimestamps:   *opts.WordTimestamps,
+		SpeakerLabels:    *opts.SpeakerLabels,
+		NLTK:             *opts.NLTK,
+		Tier:             string(*opts.Tier),
+		CustomVocabulary: opts.CustomVocabulary,
+		CallbackURL:      opts.CallbackURL,
+	}
+}
+
+// submitURL registers a job the platform fetches itself, returning
+// (jobID, downloadURL). No bytes leave this process.
+func (c *Client) submitURL(ctx context.Context, audioURL string, opts TranscribeOptions) (string, string, error) {
+	body := uploadBody(0, opts)
+	body.AudioURL = audioURL
+
+	var resp uploadResponse
+	if err := c.apiRequest(ctx, "POST", "/api/v1/upload", body, &resp); err != nil {
+		return "", "", err
+	}
+	return resp.JobID, resp.DownloadURL, nil
 }
 
 // ingestUpload gets audio into the platform and returns (jobID, downloadURL).
 // It prefers a multipart upload (when Multipart is set) and falls back to a
 // single presigned PUT if the server has multipart disabled or a multipart
 // upload fails mid-flight.
-func (c *Client) ingestUpload(data []byte, opts TranscribeOptions, byteCb func(sent, total int)) (string, string, error) {
+func (c *Client) ingestUpload(ctx context.Context, data []byte, opts TranscribeOptions, byteCb func(sent, total int)) (string, string, error) {
 	if c.Multipart {
-		jobID, downloadURL, err := c.uploadMultipart(data, opts, byteCb)
+		jobID, downloadURL, err := c.uploadMultipart(ctx, data, opts, byteCb)
 		if err == nil {
 			return jobID, downloadURL, nil
 		}
@@ -221,14 +257,14 @@ func (c *Client) ingestUpload(data []byte, opts TranscribeOptions, byteCb func(s
 		}
 		// multipart unavailable — fall through to the single-shot path
 	}
-	job, err := c.CreateUploadJob(len(data), opts)
+	job, err := c.CreateUploadJob(ctx, len(data), opts)
 	if err != nil {
 		return "", "", err
 	}
-	if err := c.uploadAudio(job.UploadURL, data, job.JobID, byteCb); err != nil {
+	if err := c.uploadAudio(ctx, job.UploadURL, data, job.JobID, byteCb); err != nil {
 		return "", "", err
 	}
-	if err := c.CompleteUpload(job.JobID); err != nil {
+	if err := c.CompleteUpload(ctx, job.JobID); err != nil {
 		return "", "", err
 	}
 	return job.JobID, job.DownloadURL, nil
@@ -238,20 +274,9 @@ func (c *Client) ingestUpload(data []byte, opts TranscribeOptions, byteCb func(s
 // complete. It returns an error wrapping errMultipartUnavailable when the
 // server has multipart disabled (404) or a mid-flight failure means we should
 // retry via the single-shot path. Other errors (e.g. create 5xx) propagate.
-func (c *Client) uploadMultipart(data []byte, opts TranscribeOptions, byteCb func(sent, total int)) (string, string, error) {
-	opts = opts.withDefaults()
-	body := uploadRequest{
-		FileSize:         len(data),
-		OutputType:       string(opts.OutputType),
-		WordTimestamps:   *opts.WordTimestamps,
-		SpeakerLabels:    *opts.SpeakerLabels,
-		NLTK:             *opts.NLTK,
-		Tier:             string(*opts.Tier),
-		CustomVocabulary: opts.CustomVocabulary,
-		CallbackURL:      opts.CallbackURL,
-	}
+func (c *Client) uploadMultipart(ctx context.Context, data []byte, opts TranscribeOptions, byteCb func(sent, total int)) (string, string, error) {
 	var created multipartCreateResponse
-	if err := c.apiRequest("POST", "/api/v1/upload/multipart/create", body, &created); err != nil {
+	if err := c.apiRequest(ctx, "POST", "/api/v1/upload/multipart/create", uploadBody(len(data), opts), &created); err != nil {
 		var nf *JobNotFoundError
 		if errors.As(err, &nf) { // route returns 404 when multipart is disabled
 			return "", "", fmt.Errorf("multipart disabled: %w", errMultipartUnavailable)
@@ -267,9 +292,12 @@ func (c *Client) uploadMultipart(data []byte, opts TranscribeOptions, byteCb fun
 		if end > len(data) {
 			end = len(data)
 		}
-		etag, err := c.putPart(p.URL, data[start:end])
+		etag, err := c.putPart(ctx, p.URL, data[start:end])
 		if err != nil {
-			c.abortMultipart(created.JobID)
+			if ctx.Err() != nil {
+				return "", "", ctx.Err()
+			}
+			c.abortMultipart(ctx, created.JobID)
 			return "", "", fmt.Errorf("multipart part upload failed: %w", errMultipartUnavailable)
 		}
 		completed = append(completed, completedPart{PartNumber: p.PartNumber, ETag: etag})
@@ -279,17 +307,28 @@ func (c *Client) uploadMultipart(data []byte, opts TranscribeOptions, byteCb fun
 		}
 	}
 
-	if err := c.apiRequest("POST", "/api/v1/upload/multipart/complete",
+	if err := c.apiRequest(ctx, "POST", "/api/v1/upload/multipart/complete",
 		map[string]any{"job_id": created.JobID, "parts": completed}, nil); err != nil {
-		c.abortMultipart(created.JobID)
+		if ctx.Err() != nil {
+			return "", "", ctx.Err()
+		}
+		c.abortMultipart(ctx, created.JobID)
 		return "", "", fmt.Errorf("multipart complete failed: %w", errMultipartUnavailable)
 	}
 	return created.JobID, created.DownloadURL, nil
 }
 
+type completedPart struct {
+	PartNumber int    `json:"part_number"`
+	ETag       string `json:"etag"`
+}
+
 // putPart PUTs one part to its presigned URL and returns the S3 ETag.
-func (c *Client) putPart(rawURL string, chunk []byte) (string, error) {
-	req, err := http.NewRequest("PUT", rawURL, bytes.NewReader(chunk))
+func (c *Client) putPart(ctx context.Context, rawURL string, chunk []byte) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, uploadTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "PUT", rawURL, bytes.NewReader(chunk))
 	if err != nil {
 		return "", err
 	}
@@ -310,44 +349,27 @@ func (c *Client) putPart(rawURL string, chunk []byte) (string, error) {
 	return etag, nil
 }
 
-// abortMultipart best-effort discards an in-progress multipart upload.
-func (c *Client) abortMultipart(jobID string) {
-	_ = c.apiRequest("POST", "/api/v1/upload/multipart/abort", map[string]string{"job_id": jobID}, nil)
+// abortMultipart best-effort discards an in-progress multipart upload. It runs
+// on its own deadline so a cancelled parent context still cleans up.
+func (c *Client) abortMultipart(ctx context.Context, jobID string) {
+	if ctx.Err() != nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(ctx, apiTimeout)
+	defer cancel()
+	_ = c.apiRequest(ctx, "POST", "/api/v1/upload/multipart/abort", map[string]string{"job_id": jobID}, nil)
 }
 
 // CreateUploadJob calls POST /api/v1/upload.
-func (c *Client) CreateUploadJob(fileSize int, opts TranscribeOptions) (*UploadJob, error) {
-	opts = opts.withDefaults()
-	body := uploadRequest{
-		FileSize:         fileSize,
-		OutputType:       string(opts.OutputType),
-		WordTimestamps:   *opts.WordTimestamps,
-		SpeakerLabels:    *opts.SpeakerLabels,
-		NLTK:             *opts.NLTK,
-		Tier:             string(*opts.Tier),
-		CustomVocabulary: opts.CustomVocabulary,
-		CallbackURL:      opts.CallbackURL,
-	}
+func (c *Client) CreateUploadJob(ctx context.Context, fileSize int, opts TranscribeOptions) (*UploadJob, error) {
 	var resp uploadResponse
-	if err := c.apiRequest("POST", "/api/v1/upload", body, &resp); err != nil {
+	if err := c.apiRequest(ctx, "POST", "/api/v1/upload", uploadBody(fileSize, opts), &resp); err != nil {
 		return nil, err
-	}
-
-	var uploadURL any
-	var asString string
-	if err := json.Unmarshal(resp.UploadURL, &asString); err == nil {
-		uploadURL = asString
-	} else {
-		var post PresignedPost
-		if err := json.Unmarshal(resp.UploadURL, &post); err != nil {
-			return nil, apiErr("invalid upload_url in response", 0, string(resp.UploadURL))
-		}
-		uploadURL = post
 	}
 
 	return &UploadJob{
 		JobID:       resp.JobID,
-		UploadURL:   uploadURL,
+		UploadURL:   resp.UploadURL,
 		DownloadURL: resp.DownloadURL,
 		ContentType: resp.ContentType,
 		ExpiresIn:   resp.ExpiresIn,
@@ -355,19 +377,19 @@ func (c *Client) CreateUploadJob(fileSize int, opts TranscribeOptions) (*UploadJ
 }
 
 // TouchUploadProgress calls POST /api/v1/upload/progress.
-func (c *Client) TouchUploadProgress(jobID string) error {
-	return c.apiRequest("POST", "/api/v1/upload/progress", map[string]string{"job_id": jobID}, nil)
+func (c *Client) TouchUploadProgress(ctx context.Context, jobID string) error {
+	return c.apiRequest(ctx, "POST", "/api/v1/upload/progress", map[string]string{"job_id": jobID}, nil)
 }
 
 // UploadAudio streams bytes to the presigned URL, with progress heartbeats.
-func (c *Client) UploadAudio(uploadURL any, data []byte, jobID string) error {
-	return c.uploadAudio(uploadURL, data, jobID, nil)
+func (c *Client) UploadAudio(ctx context.Context, uploadURL string, data []byte, jobID string) error {
+	return c.uploadAudio(ctx, uploadURL, data, jobID, nil)
 }
 
 // uploadAudio is UploadAudio with an optional byte-level progress callback
 // (sent, total) reported as bytes are streamed to the presigned target.
-func (c *Client) uploadAudio(uploadURL any, data []byte, jobID string, byteCb func(sent, total int)) error {
-	stop := make(chan struct{})
+func (c *Client) uploadAudio(ctx context.Context, uploadURL string, data []byte, jobID string, byteCb func(sent, total int)) error {
+	heartbeatCtx, stopHeartbeat := context.WithCancel(ctx)
 	var wg sync.WaitGroup
 	if jobID != "" {
 		wg.Add(1)
@@ -377,60 +399,75 @@ func (c *Client) uploadAudio(uploadURL any, data []byte, jobID string, byteCb fu
 			defer t.Stop()
 			for {
 				select {
-				case <-stop:
+				case <-heartbeatCtx.Done():
 					return
 				case <-t.C:
-					_ = c.TouchUploadProgress(jobID)
+					_ = c.TouchUploadProgress(heartbeatCtx, jobID)
 				}
 			}
 		}()
 	}
+	defer func() {
+		stopHeartbeat()
+		wg.Wait()
+	}()
 
 	var lastErr error
 	for attempt := 1; attempt <= uploadMaxAttempts; attempt++ {
-		lastErr = c.putOrPostUpload(uploadURL, data, byteCb)
+		lastErr = c.putUpload(ctx, uploadURL, data, byteCb)
 		if lastErr == nil {
-			close(stop)
-			wg.Wait()
 			return nil
 		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		if attempt < uploadMaxAttempts {
-			time.Sleep(uploadBaseDelay * time.Duration(1<<(attempt-1)))
+			if err := sleepCtx(ctx, uploadBaseDelay*time.Duration(1<<(attempt-1))); err != nil {
+				return err
+			}
 		}
 	}
-	close(stop)
-	wg.Wait()
 	return uploadErr(fmt.Sprintf("Upload failed after %d attempts: %v", uploadMaxAttempts, lastErr))
 }
 
 // CompleteUpload calls POST /api/v1/upload/complete.
-func (c *Client) CompleteUpload(jobID string) error {
-	return c.apiRequest("POST", "/api/v1/upload/complete", map[string]string{"job_id": jobID}, nil)
+func (c *Client) CompleteUpload(ctx context.Context, jobID string) error {
+	return c.apiRequest(ctx, "POST", "/api/v1/upload/complete", map[string]string{"job_id": jobID}, nil)
 }
 
 // WaitForResult waits via SSE (with polling fallback) and downloads the result.
-func (c *Client) WaitForResult(jobID, downloadURL string, onProgress ProgressFunc) ([]byte, string, error) {
+func (c *Client) WaitForResult(ctx context.Context, jobID, downloadURL string, onProgress ProgressFunc) ([]byte, string, error) {
 	timeout := c.Timeout
 	if timeout <= 0 {
 		timeout = 600 * time.Second
 	}
 
-	url, err := c.waitSSE(jobID, downloadURL, onProgress, timeout)
+	url, err := c.waitSSE(ctx, jobID, downloadURL, onProgress, timeout)
 	if err != nil {
 		return nil, "", err
 	}
 	if url == "" {
-		content, err := c.waitPoll(jobID, downloadURL, timeout)
+		content, err := c.waitPoll(ctx, jobID, downloadURL, timeout)
 		return content, downloadURL, err
 	}
-	content, err := c.DownloadResult(url)
+	content, err := c.DownloadResult(ctx, url)
 	return content, url, err
 }
 
 // DownloadResult GETs the result bytes from a download URL.
-func (c *Client) DownloadResult(downloadURL string) ([]byte, error) {
-	resp, err := c.HTTP.Get(downloadURL)
+func (c *Client) DownloadResult(ctx context.Context, downloadURL string) ([]byte, error) {
+	reqCtx, cancel := context.WithTimeout(ctx, downloadTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, "GET", downloadURL, nil)
 	if err != nil {
+		return nil, err
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		return nil, apiErr(fmt.Sprintf("Download failed: %v", err), 0, "")
 	}
 	defer resp.Body.Close()
@@ -442,16 +479,16 @@ func (c *Client) DownloadResult(downloadURL string) ([]byte, error) {
 }
 
 // CancelJob calls POST /api/v1/jobs/cancel.
-func (c *Client) CancelJob(jobID string) error {
-	return c.apiRequest("POST", "/api/v1/jobs/cancel", map[string]string{"job_id": jobID}, nil)
+func (c *Client) CancelJob(ctx context.Context, jobID string) error {
+	return c.apiRequest(ctx, "POST", "/api/v1/jobs/cancel", map[string]string{"job_id": jobID}, nil)
 }
 
 // CheckFailed calls POST /api/v1/jobs/check-failed.
-func (c *Client) CheckFailed(jobIDs []string) ([]bool, error) {
+func (c *Client) CheckFailed(ctx context.Context, jobIDs []string) ([]bool, error) {
 	var resp struct {
 		FailedJobs []bool `json:"failed_jobs"`
 	}
-	if err := c.apiRequest("POST", "/api/v1/jobs/check-failed", map[string]any{"job_ids": jobIDs}, &resp); err != nil {
+	if err := c.apiRequest(ctx, "POST", "/api/v1/jobs/check-failed", map[string]any{"job_ids": jobIDs}, &resp); err != nil {
 		return nil, err
 	}
 	return resp.FailedJobs, nil
@@ -459,9 +496,9 @@ func (c *Client) CheckFailed(jobIDs []string) ([]bool, error) {
 
 // GetJobStatus calls GET /api/v1/jobs/{id} for the current status (and a fresh
 // download URL once the job has completed).
-func (c *Client) GetJobStatus(jobID string) (*JobStatus, error) {
+func (c *Client) GetJobStatus(ctx context.Context, jobID string) (*JobStatus, error) {
 	var st JobStatus
-	if err := c.apiRequest("GET", "/api/v1/jobs/"+url.PathEscape(jobID), nil, &st); err != nil {
+	if err := c.apiRequest(ctx, "GET", "/api/v1/jobs/"+url.PathEscape(jobID), nil, &st); err != nil {
 		return nil, err
 	}
 	if st.JobID == "" {
@@ -474,11 +511,11 @@ func (c *Client) GetJobStatus(jobID string) (*JobStatus, error) {
 // returns a JobFailedError if the job failed, or an error if it is still
 // processing (poll GetJobStatus for that case). Pass "" for outputType to
 // default to JSON.
-func (c *Client) GetTranscript(jobID string, outputType OutputType) (*Transcript, error) {
+func (c *Client) GetTranscript(ctx context.Context, jobID string, outputType OutputType) (*Transcript, error) {
 	if outputType == "" {
 		outputType = OutputJSON
 	}
-	st, err := c.GetJobStatus(jobID)
+	st, err := c.GetJobStatus(ctx, jobID)
 	if err != nil {
 		return nil, err
 	}
@@ -488,7 +525,7 @@ func (c *Client) GetTranscript(jobID string, outputType OutputType) (*Transcript
 	if !st.IsCompleted() || st.DownloadURL == "" {
 		return nil, fmt.Errorf("job %s is not complete (status=%s)", jobID, st.Status)
 	}
-	content, err := c.DownloadResult(st.DownloadURL)
+	content, err := c.DownloadResult(ctx, st.DownloadURL)
 	if err != nil {
 		return nil, err
 	}
@@ -498,7 +535,7 @@ func (c *Client) GetTranscript(jobID string, outputType OutputType) (*Transcript
 // ListJobs calls GET /api/v1/jobs — the caller's most-recent jobs, newest
 // first, cursor-paginated. Pass the returned NextBefore as before for the next
 // page; limit <= 0 defaults to 50.
-func (c *Client) ListJobs(limit int, before string) (*JobList, error) {
+func (c *Client) ListJobs(ctx context.Context, limit int, before string) (*JobList, error) {
 	if limit <= 0 {
 		limit = 50
 	}
@@ -507,136 +544,162 @@ func (c *Client) ListJobs(limit int, before string) (*JobList, error) {
 		path += "&before=" + url.QueryEscape(before)
 	}
 	var out JobList
-	if err := c.apiRequest("GET", path, nil, &out); err != nil {
+	if err := c.apiRequest(ctx, "GET", path, nil, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
 }
 
-func (c *Client) apiRequest(method, path string, body any, out any) error {
-	var reader io.Reader
+// apiRequest sends a JSON request, retrying transient failures and 429/5xx
+// responses with exponential backoff (honoring Retry-After).
+func (c *Client) apiRequest(ctx context.Context, method, path string, body any, out any) error {
+	var payload []byte
 	if body != nil {
 		b, err := json.Marshal(body)
 		if err != nil {
 			return err
 		}
-		reader = bytes.NewReader(b)
+		payload = b
 	}
 
-	req, err := http.NewRequest(method, strings.TrimRight(c.BaseURL, "/")+path, reader)
+	maxRetries := c.MaxRetries
+	if maxRetries < 0 {
+		maxRetries = 0
+	}
+
+	for attempt := 1; ; attempt++ {
+		status, header, respBody, err := c.doJSON(ctx, method, path, payload)
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if attempt <= maxRetries {
+				if serr := sleepCtx(ctx, c.retryDelay(attempt, 0, false)); serr != nil {
+					return serr
+				}
+				continue
+			}
+			return apiErr(fmt.Sprintf("Cannot connect to %s: %v", c.BaseURL, err), 0, "")
+		}
+
+		if retryStatusCodes[status] && attempt <= maxRetries {
+			retryAfter, ok := parseRetryAfter(header.Get("Retry-After"))
+			if serr := sleepCtx(ctx, c.retryDelay(attempt, retryAfter, ok)); serr != nil {
+				return serr
+			}
+			continue
+		}
+
+		if err := raiseForStatus(status, header, respBody); err != nil {
+			return err
+		}
+		if out == nil || len(respBody) == 0 {
+			return nil
+		}
+		return json.Unmarshal(respBody, out)
+	}
+}
+
+// doJSON performs one attempt and reads the whole response.
+func (c *Client) doJSON(ctx context.Context, method, path string, payload []byte) (int, http.Header, []byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, apiTimeout)
+	defer cancel()
+
+	var reader io.Reader
+	if payload != nil {
+		reader = bytes.NewReader(payload)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, strings.TrimRight(c.BaseURL, "/")+path, reader)
 	if err != nil {
-		return err
+		return 0, nil, nil, err
 	}
 	req.Header.Set("X-API-Key", c.APIKey)
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return apiErr(fmt.Sprintf("Cannot connect to %s: %v", c.BaseURL, err), 0, "")
+		return 0, nil, nil, err
 	}
 	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(resp.Body)
-
-	if err := c.raiseForStatus(resp.StatusCode, respBody); err != nil {
-		return err
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, nil, nil, err
 	}
-	if out == nil || len(respBody) == 0 {
-		return nil
-	}
-	return json.Unmarshal(respBody, out)
+	return resp.StatusCode, resp.Header, respBody, nil
 }
 
-func (c *Client) raiseForStatus(status int, body []byte) error {
+func (c *Client) retryDelay(attempt int, retryAfter float64, hasRetryAfter bool) time.Duration {
+	if hasRetryAfter {
+		d := time.Duration(retryAfter * float64(time.Second))
+		if d > retryBackoffMax {
+			return retryBackoffMax
+		}
+		return d
+	}
+	base := c.RetryBackoff
+	if base <= 0 {
+		base = defaultRetryBackoff
+	}
+	d := time.Duration(math.Min(float64(base)*math.Pow(2, float64(attempt-1)), float64(retryBackoffMax)))
+	return d
+}
+
+func raiseForStatus(status int, header http.Header, body []byte) error {
 	if status == 200 || status == 204 {
 		return nil
 	}
-	text := truncate(string(body), 300)
+	base := baseError{
+		StatusCode: status,
+		RequestID:  requestID(header),
+		Body:       truncate(string(body), 300),
+	}
 	switch status {
 	case 401:
-		return authErr("Unauthorized — check your API key")
+		base.Message = "Unauthorized — check your API key"
+		return &AuthenticationError{base}
 	case 404:
-		return notFoundErr("Job not found or upload session expired")
+		base.Message = "Job not found or upload session expired"
+		return &JobNotFoundError{base}
 	case 429:
-		return rateLimitErr("Rate limit exceeded — try again shortly")
+		base.Message = "Rate limit exceeded — try again shortly"
+		retryAfter, _ := parseRetryAfter(header.Get("Retry-After"))
+		return &RateLimitError{baseError: base, RetryAfter: retryAfter}
 	default:
-		return apiErr(fmt.Sprintf("Unexpected response (HTTP %d)", status), status, text)
+		base.Message = fmt.Sprintf("Unexpected response (HTTP %d)", status)
+		return &APIError{base}
 	}
 }
 
-func (c *Client) putOrPostUpload(uploadURL any, data []byte, byteCb func(sent, total int)) error {
-	switch u := uploadURL.(type) {
-	case string:
-		// Stream the body through a counting reader while keeping Content-Length
-		// correct and explicit — a presigned S3 PUT rejects chunked transfer
-		// encoding, so ContentLength must be set so net/http does NOT chunk.
-		var body io.Reader = bytes.NewReader(data)
-		if byteCb != nil {
-			body = &progressReader{data: data, cb: byteCb}
-		}
-		req, err := http.NewRequest("PUT", u, body)
-		if err != nil {
-			return err
-		}
-		req.ContentLength = int64(len(data))
-		req.Header.Set("Content-Type", "application/octet-stream")
-		resp, err := c.HTTP.Do(req)
-		if err != nil {
-			return err
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode != 200 && resp.StatusCode != 204 {
-			b, _ := io.ReadAll(resp.Body)
-			return uploadErr(fmt.Sprintf("HTTP %d: %s", resp.StatusCode, truncate(string(b), 200)))
-		}
-		return nil
+func (c *Client) putUpload(ctx context.Context, uploadURL string, data []byte, byteCb func(sent, total int)) error {
+	ctx, cancel := context.WithTimeout(ctx, uploadTimeout)
+	defer cancel()
 
-	case PresignedPost:
-		var buf bytes.Buffer
-		w := multipart.NewWriter(&buf)
-		for k, v := range u.Fields {
-			_ = w.WriteField(k, v)
-		}
-		h := make(textproto.MIMEHeader)
-		h.Set("Content-Disposition", `form-data; name="file"; filename="audio"`)
-		h.Set("Content-Type", "application/octet-stream")
-		part, err := w.CreatePart(h)
-		if err != nil {
-			return err
-		}
-		if _, err := part.Write(data); err != nil {
-			return err
-		}
-		if err := w.Close(); err != nil {
-			return err
-		}
-		payload := buf.Bytes()
-		var body io.Reader = bytes.NewReader(payload)
-		if byteCb != nil {
-			body = &progressReader{data: payload, cb: byteCb}
-		}
-		req, err := http.NewRequest("POST", u.URL, body)
-		if err != nil {
-			return err
-		}
-		req.ContentLength = int64(len(payload))
-		req.Header.Set("Content-Type", w.FormDataContentType())
-		resp, err := c.HTTP.Do(req)
-		if err != nil {
-			return err
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode != 200 && resp.StatusCode != 204 {
-			b, _ := io.ReadAll(resp.Body)
-			return uploadErr(fmt.Sprintf("HTTP %d: %s", resp.StatusCode, truncate(string(b), 200)))
-		}
-		return nil
-
-	default:
-		return uploadErr(fmt.Sprintf("unsupported upload_url type: %T", uploadURL))
+	// Stream the body through a counting reader while keeping Content-Length
+	// correct and explicit — a presigned S3 PUT rejects chunked transfer
+	// encoding, so ContentLength must be set so net/http does NOT chunk.
+	var body io.Reader = bytes.NewReader(data)
+	if byteCb != nil {
+		body = &progressReader{data: data, cb: byteCb}
 	}
+	req, err := http.NewRequestWithContext(ctx, "PUT", uploadURL, body)
+	if err != nil {
+		return err
+	}
+	req.ContentLength = int64(len(data))
+	req.Header.Set("Content-Type", "application/octet-stream")
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 && resp.StatusCode != 204 {
+		b, _ := io.ReadAll(resp.Body)
+		return uploadErr(fmt.Sprintf("HTTP %d: %s", resp.StatusCode, truncate(string(b), 200)))
+	}
+	return nil
 }
 
-func (c *Client) waitSSE(jobID, fallback string, onProgress ProgressFunc, timeout time.Duration) (string, error) {
+func (c *Client) waitSSE(ctx context.Context, jobID, fallback string, onProgress ProgressFunc, timeout time.Duration) (string, error) {
 	start := time.Now()
 	var lastEventID string
 	reconnects := 0
@@ -649,10 +712,12 @@ func (c *Client) waitSSE(jobID, fallback string, onProgress ProgressFunc, timeou
 			return "", nil // signal polling fallback
 		}
 		if reconnects > 0 {
-			time.Sleep(sseReconnectDelay)
+			if err := sleepCtx(ctx, sseReconnectDelay); err != nil {
+				return "", err
+			}
 		}
 
-		outcome, url, newID, err := c.sseAttempt(jobID, start, timeout, lastEventID, fallback, onProgress)
+		outcome, url, newID, err := c.sseAttempt(ctx, jobID, start, timeout, lastEventID, fallback, onProgress)
 		if newID != "" {
 			lastEventID = newID
 		}
@@ -674,6 +739,7 @@ func (c *Client) waitSSE(jobID, fallback string, onProgress ProgressFunc, timeou
 }
 
 func (c *Client) sseAttempt(
+	ctx context.Context,
 	jobID string,
 	start time.Time,
 	timeout time.Duration,
@@ -686,7 +752,10 @@ func (c *Client) sseAttempt(
 		return "timeout", "", newLastID, nil
 	}
 
-	req, err := http.NewRequest("GET", strings.TrimRight(c.BaseURL, "/")+"/api/v1/jobs/"+jobID+"/stream", nil)
+	reqCtx, cancel := context.WithTimeout(ctx, timeout-time.Since(start))
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, "GET", strings.TrimRight(c.BaseURL, "/")+"/api/v1/jobs/"+url.PathEscape(jobID)+"/stream", nil)
 	if err != nil {
 		return "reconnect", "", newLastID, nil
 	}
@@ -696,10 +765,11 @@ func (c *Client) sseAttempt(
 		req.Header.Set("Last-Event-ID", lastEventID)
 	}
 
-	remaining := timeout - time.Since(start)
-	client := &http.Client{Timeout: remaining}
-	resp, err := client.Do(req)
+	resp, err := c.HTTP.Do(req)
 	if err != nil {
+		if ctx.Err() != nil {
+			return "", "", newLastID, ctx.Err()
+		}
 		return "reconnect", "", newLastID, nil
 	}
 	defer resp.Body.Close()
@@ -708,7 +778,11 @@ func (c *Client) sseAttempt(
 	case 401:
 		return "", "", newLastID, authErr("Unauthorized — check your API key")
 	case 429:
-		return "", "", newLastID, rateLimitErr("Rate limit exceeded on SSE endpoint")
+		return "", "", newLastID, &RateLimitError{baseError: baseError{
+			Message:    "Rate limit exceeded on SSE endpoint",
+			StatusCode: 429,
+			RequestID:  requestID(resp.Header),
+		}}
 	case 200:
 	default:
 		return "reconnect", "", newLastID, nil
@@ -718,20 +792,21 @@ func (c *Client) sseAttempt(
 	// Allow large SSE frames
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
-	event := map[string]string{}
+	event := newSSEEvent()
 	flush := func() (string, string, error) {
-		dataRaw := event["data"]
-		if dataRaw == "" {
-			event = map[string]string{}
+		dataRaw, hasData := event.data()
+		if !hasData {
+			event = newSSEEvent()
 			return "", "", nil
 		}
-		eventType := event["event"]
+		eventType := event.fields["event"]
 		if eventType == "" {
 			eventType = "message"
 		}
-		if id := event["id"]; id != "" {
+		if id := event.fields["id"]; id != "" {
 			newLastID = id
 		}
+		event = newSSEEvent()
 
 		var data map[string]any
 		if jerr := json.Unmarshal([]byte(dataRaw), &data); jerr != nil {
@@ -755,7 +830,6 @@ func (c *Client) sseAttempt(
 			if dl == "" {
 				dl = fallback
 			}
-			event = map[string]string{}
 			return "done", dl, nil
 		case "failed":
 			step := asString(data["step"])
@@ -768,11 +842,13 @@ func (c *Client) sseAttempt(
 			}
 			return "", "", jobFailedErr(step, reason)
 		}
-		event = map[string]string{}
 		return "", "", nil
 	}
 
 	for scanner.Scan() {
+		if ctx.Err() != nil {
+			return "", "", newLastID, ctx.Err()
+		}
 		if time.Since(start) >= timeout {
 			return "timeout", "", newLastID, nil
 		}
@@ -790,15 +866,16 @@ func (c *Client) sseAttempt(
 		if strings.HasPrefix(line, ":") {
 			continue
 		}
-		field, value, _ := strings.Cut(line, ":")
-		value = strings.TrimPrefix(value, " ")
-		event[field] = value
+		event.add(line)
 	}
 
+	if ctx.Err() != nil {
+		return "", "", newLastID, ctx.Err()
+	}
 	return "reconnect", "", newLastID, nil
 }
 
-func (c *Client) waitPoll(jobID, downloadURL string, timeout time.Duration) ([]byte, error) {
+func (c *Client) waitPoll(ctx context.Context, jobID, downloadURL string, timeout time.Duration) ([]byte, error) {
 	start := time.Now()
 	maxAttempts := int(timeout / pollInterval)
 	if maxAttempts < 1 {
@@ -809,28 +886,79 @@ func (c *Client) waitPoll(jobID, downloadURL string, timeout time.Duration) ([]b
 		if time.Since(start) >= timeout {
 			break
 		}
-		failed, err := c.CheckFailed([]string{jobID})
+		failed, err := c.CheckFailed(ctx, []string{jobID})
 		if err == nil && len(failed) > 0 && failed[0] {
 			return nil, jobFailedErr("unknown", "job marked failed")
 		}
-		if _, ok := err.(*AuthenticationError); ok {
-			return nil, err
-		}
-
-		resp, err := c.HTTP.Get(downloadURL)
-		if err == nil {
-			body, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			if resp.StatusCode == 200 {
-				return body, nil
+		if err != nil {
+			var auth *AuthenticationError
+			if errors.As(err, &auth) || ctx.Err() != nil {
+				return nil, err
 			}
 		}
 
+		content, err := c.DownloadResult(ctx, downloadURL)
+		if err == nil {
+			return content, nil
+		}
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+
 		if attempt < maxAttempts {
-			time.Sleep(pollInterval)
+			if err := sleepCtx(ctx, pollInterval); err != nil {
+				return nil, err
+			}
 		}
 	}
 	return nil, timeoutErr(fmt.Sprintf("Job %s did not complete within %s", jobID, timeout))
+}
+
+// sseEvent accumulates the fields of one SSE frame. Repeated data lines are
+// joined with newlines, as the spec requires.
+type sseEvent struct {
+	fields   map[string]string
+	dataLine []string
+}
+
+func newSSEEvent() *sseEvent {
+	return &sseEvent{fields: map[string]string{}}
+}
+
+func (e *sseEvent) add(line string) {
+	field, value, found := strings.Cut(line, ":")
+	if !found {
+		field, value = line, ""
+	}
+	value = strings.TrimPrefix(value, " ")
+	if field == "data" {
+		e.dataLine = append(e.dataLine, value)
+		return
+	}
+	e.fields[field] = value
+}
+
+func (e *sseEvent) data() (string, bool) {
+	if len(e.dataLine) == 0 {
+		return "", false
+	}
+	return strings.Join(e.dataLine, "\n"), true
+}
+
+func isURL(s string) bool {
+	return strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://")
+}
+
+// sleepCtx waits for d, or returns early if the context is done.
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
 }
 
 func truncate(s string, n int) string {

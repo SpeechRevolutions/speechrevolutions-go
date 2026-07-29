@@ -5,6 +5,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"sync"
@@ -70,7 +71,7 @@ func main() {
 	}
 
 	// Transcription-phase callback is the 3rd arg to Transcribe.
-	result, err := client.Transcribe("audio.mp3", opts, func(e stt.ProgressEvent) {
+	result, err := client.Transcribe(context.Background(), "audio.mp3", opts, func(e stt.ProgressEvent) {
 		prog.set("transcribe", uploadWeight*100+pct(e)*transcribeWeight)
 		ph, p := prog.snapshot()
 		fmt.Printf("  [%10s] %5.1f%%\n", ph, p)
