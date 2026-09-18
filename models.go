@@ -27,6 +27,15 @@ const (
 )
 
 // TranscribeOptions controls how audio is transcribed.
+// Bool returns a pointer to b, for the optional *bool fields on
+// TranscribeOptions. Without it every call site needs a throwaway variable:
+//
+//	opts := stt.TranscribeOptions{SpeakerLabels: stt.Bool(true)}
+func Bool(b bool) *bool { return &b }
+
+// Tier returns a pointer to t, for TranscribeOptions.Tier.
+func Tier(t ProcessingTier) *ProcessingTier { return &t }
+
 type TranscribeOptions struct {
 	OutputType       OutputType
 	WordTimestamps   *bool
