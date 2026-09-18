@@ -432,3 +432,232 @@ func TestLiveWebhookIsDeliveredByTheRealPipeline(t *testing.T) {
 		t.Log("NOTE: no X-SR-Signature — webhook_signing_secret is unset server-side")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Ingestion paths, output types, options and transforms
+//
+// The suite above covers the path most callers take. These cover the rest of
+// the published surface, so that "tested live" means every exported method has
+// actually been run against production rather than only the common ones.
+//
+// The URL tests need a PUBLICLY reachable audio file, because the platform
+// fetches it server-side: SR_LIVE_AUDIO_URL=https://.../clip.mp3
+// ---------------------------------------------------------------------------
+
+func liveAudioURL(t *testing.T) string {
+	t.Helper()
+	u := os.Getenv("SR_LIVE_AUDIO_URL")
+	if u == "" {
+		t.Skip("set SR_LIVE_AUDIO_URL to a publicly reachable audio file " +
+			"(the platform fetches it server-side, so a local path will not do)")
+	}
+	return u
+}
+
+func TestLiveTranscribeURL(t *testing.T) {
+	c, ctx := liveAPIClient(t), liveCtx(t)
+	url := liveAudioURL(t)
+
+	// The explicit alias, and the auto-detection in Transcribe, must both hand
+	// the URL to the server rather than download it here.
+	result, err := c.TranscribeURL(ctx, url, TranscribeOptions{}, nil)
+	if err != nil {
+		t.Fatalf("TranscribeURL: %v", err)
+	}
+	if strings.TrimSpace(result.Text()) == "" {
+		t.Error("empty transcript from TranscribeURL")
+	}
+
+	auto, err := c.Transcribe(ctx, url, TranscribeOptions{}, nil)
+	if err != nil {
+		t.Fatalf("Transcribe(url): %v", err)
+	}
+	if strings.TrimSpace(auto.Text()) == "" {
+		t.Error("empty transcript from auto-detected URL")
+	}
+}
+
+func TestLiveTranscribeFile(t *testing.T) {
+	c, ctx, audio := liveAPIClient(t), liveCtx(t), liveAudio(t)
+
+	result, err := c.TranscribeFile(ctx, audio, TranscribeOptions{}, nil)
+	if err != nil {
+		t.Fatalf("TranscribeFile: %v", err)
+	}
+	if strings.TrimSpace(result.Text()) == "" {
+		t.Error("empty transcript from TranscribeFile")
+	}
+}
+
+func TestLiveSubmitURLAndSubmitBytes(t *testing.T) {
+	c, ctx, audio := liveAPIClient(t), liveCtx(t), liveAudio(t)
+
+	data, err := os.ReadFile(audio)
+	if err != nil {
+		t.Fatalf("read audio: %v", err)
+	}
+	byteJob, err := c.SubmitBytes(ctx, data, TranscribeOptions{})
+	if err != nil {
+		t.Fatalf("SubmitBytes: %v", err)
+	}
+	if len(byteJob) != 36 {
+		t.Errorf("SubmitBytes returned %q, not a UUID", byteJob)
+	}
+
+	if u := os.Getenv("SR_LIVE_AUDIO_URL"); u != "" {
+		urlJob, err := c.SubmitURL(ctx, u, TranscribeOptions{})
+		if err != nil {
+			t.Fatalf("SubmitURL: %v", err)
+		}
+		if len(urlJob) != 36 {
+			t.Errorf("SubmitURL returned %q, not a UUID", urlJob)
+		}
+	}
+}
+
+// Every output type the API advertises, against the real renderer. Only SRT had
+// ever been checked live, and docx/pdf go through a different server-side path
+// than the text formats.
+func TestLiveEveryOutputType(t *testing.T) {
+	c, ctx, audio := liveAPIClient(t), liveCtx(t), liveAudio(t)
+
+	for _, tc := range []struct {
+		out      OutputType
+		contains string // expected in the decoded text, "" for binary formats
+	}{
+		{OutputJSON, ""},
+		{OutputTXT, ""},
+		{OutputSRT, "-->"},
+		{OutputVTT, "-->"},
+		{OutputDOCX, ""},
+		{OutputPDF, ""},
+	} {
+		tc := tc
+		t.Run(string(tc.out), func(t *testing.T) {
+			result, err := c.Transcribe(ctx, audio, TranscribeOptions{OutputType: tc.out}, nil)
+			if err != nil {
+				t.Fatalf("Transcribe(%s): %v", tc.out, err)
+			}
+			if len(result.Content) == 0 {
+				t.Fatalf("%s came back with no bytes", tc.out)
+			}
+			if tc.contains != "" && !strings.Contains(result.Text(), tc.contains) {
+				t.Errorf("%s does not contain %q: %.120q", tc.out, tc.contains, result.Text())
+			}
+			if tc.out == OutputDOCX && !strings.HasPrefix(string(result.Content), "PK") {
+				t.Errorf("docx is not a zip container: %.8q", result.Content)
+			}
+			if tc.out == OutputPDF && !strings.HasPrefix(string(result.Content), "%PDF") {
+				t.Errorf("pdf lacks the %%PDF header: %.8q", result.Content)
+			}
+		})
+	}
+}
+
+// The transcription options, exercised against the real model rather than a
+// mock that accepts anything.
+func TestLiveTranscribeOptions(t *testing.T) {
+	c, ctx, audio := liveAPIClient(t), liveCtx(t), liveAudio(t)
+
+	t.Run("diarize alias", func(t *testing.T) {
+		result, err := c.Transcribe(ctx, audio, TranscribeOptions{
+			Diarize: Bool(true), // Deepgram-compatible alias for SpeakerLabels
+		}, nil)
+		if err != nil {
+			t.Fatalf("Transcribe(diarize): %v", err)
+		}
+		if len(result.Utterances) == 0 {
+			t.Error("diarize produced no utterances")
+		}
+	})
+
+	t.Run("custom vocabulary", func(t *testing.T) {
+		result, err := c.Transcribe(ctx, audio, TranscribeOptions{
+			CustomVocabulary: []string{"Kyiv", "Dnipro"},
+		}, nil)
+		if err != nil {
+			t.Fatalf("Transcribe(custom_vocabulary): %v", err)
+		}
+		if strings.TrimSpace(result.Text()) == "" {
+			t.Error("empty transcript with custom vocabulary")
+		}
+	})
+
+	t.Run("word timestamps off", func(t *testing.T) {
+		result, err := c.Transcribe(ctx, audio, TranscribeOptions{
+			WordTimestamps: Bool(false),
+		}, nil)
+		if err != nil {
+			t.Fatalf("Transcribe(word_timestamps=false): %v", err)
+		}
+		if strings.TrimSpace(result.Text()) == "" {
+			t.Error("empty transcript with word timestamps off")
+		}
+	})
+}
+
+// The single-shot presigned PUT, rather than the multipart flow Transcribe
+// prefers by default. Both reach the same endpoint set, and only one of them
+// was being exercised.
+func TestLiveSingleShotUpload(t *testing.T) {
+	c, ctx, audio := liveAPIClient(t), liveCtx(t), liveAudio(t)
+	c.Multipart = false
+
+	result, err := c.Transcribe(ctx, audio, TranscribeOptions{}, nil)
+	if err != nil {
+		t.Fatalf("Transcribe with Multipart=false: %v", err)
+	}
+	if strings.TrimSpace(result.Text()) == "" {
+		t.Error("empty transcript from the single-shot upload path")
+	}
+}
+
+// The transforms, run over a real response rather than a fixture. A mock can
+// hand back a shape these happen to survive; production is the real input.
+func TestLiveTranscriptTransforms(t *testing.T) {
+	c, ctx, audio := liveAPIClient(t), liveCtx(t), liveAudio(t)
+
+	result, err := c.Transcribe(ctx, audio, TranscribeOptions{
+		SpeakerLabels: Bool(true),
+	}, nil)
+	if err != nil {
+		t.Fatalf("Transcribe: %v", err)
+	}
+
+	d := result.ToDict()
+	for _, k := range []string{"id", "status", "text", "words", "utterances", "output_type"} {
+		if _, ok := d[k]; !ok {
+			t.Errorf("ToDict is missing %q", k)
+		}
+	}
+
+	dg := result.ToDeepgram()
+	if _, ok := dg["results"]; !ok {
+		t.Errorf("ToDeepgram has no results key: %v", keysOf(dg))
+	}
+
+	dir := t.TempDir()
+	path, err := result.Save(filepath.Join(dir, "out"))
+	if err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if !strings.HasSuffix(path, ".json") {
+		t.Errorf("Save inferred %q, expected a .json extension", path)
+	}
+	info, err := os.Stat(path)
+	if err != nil || info.Size() == 0 {
+		t.Errorf("Save wrote nothing to %s (%v)", path, err)
+	}
+
+	if result.TranscriptText() != result.Text() {
+		t.Error("TranscriptText and Text disagree")
+	}
+}
+
+func keysOf(m map[string]any) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
