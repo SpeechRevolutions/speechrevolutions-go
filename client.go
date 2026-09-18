@@ -134,6 +134,13 @@ func resolveBaseURL(baseURL string) string {
 
 // NewClient creates a Client. If apiKey is empty, reads
 // SPEECHREVOLUTIONS_API_KEY or STT_API_KEY from the environment.
+// userAgent identifies the SDK to the platform, which makes a client-side
+// problem findable in our edge logs without the caller reproducing it. It
+// is also insurance: the edge answers a request with NO User-Agent with a
+// bare 403, which is how the C# client turned out to be unable to reach
+// production at all while passing every test pointed at a local mock.
+const userAgent = "speechrevolutions-go/0.2.0"
+
 func NewClient(apiKey string) (*Client, error) {
 	if apiKey == "" {
 		apiKey = os.Getenv("SPEECHREVOLUTIONS_API_KEY")
@@ -687,6 +694,7 @@ func (c *Client) doJSON(ctx context.Context, method, path string, payload []byte
 		return 0, nil, nil, err
 	}
 	req.Header.Set("X-API-Key", c.APIKey)
+	req.Header.Set("User-Agent", userAgent)
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.HTTP.Do(req)
@@ -840,6 +848,7 @@ func (c *Client) sseAttempt(
 		return "reconnect", "", newLastID, nil
 	}
 	req.Header.Set("X-API-Key", c.APIKey)
+	req.Header.Set("User-Agent", userAgent)
 	req.Header.Set("Accept", "text/event-stream")
 	if lastEventID != "" {
 		req.Header.Set("Last-Event-ID", lastEventID)
