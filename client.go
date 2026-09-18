@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -41,6 +42,42 @@ const (
 
 // Statuses worth a second attempt on a JSON API request.
 var retryStatusCodes = map[int]bool{429: true, 500: true, 502: true, 503: true, 504: true}
+
+// Endpoints that CREATE a job, and so are not safe to blindly retry.
+//
+// A job is created the moment the server handles one of these; the response
+// carrying the job ID back is what can be lost. Retrying after the request may
+// have arrived creates a SECOND job for the same audio — two transcripts, two
+// charges — and the caller never learns about the orphan. The API has no
+// idempotency key, so the only safe rule is to retry these solely when the
+// request provably never reached the server.
+//
+// Every other endpoint either reads, or acts on a job ID the caller already
+// holds, and stays fully retryable.
+var jobCreatingPaths = map[string]bool{
+	"/api/v1/upload":                  true,
+	"/api/v1/upload/multipart/create": true,
+}
+
+func createsJob(path string) bool {
+	if i := strings.IndexByte(path, '?'); i >= 0 {
+		path = path[:i]
+	}
+	return jobCreatingPaths[strings.TrimRight(path, "/")]
+}
+
+// neverReachedServer reports whether err proves the request never got to the
+// server, so retrying it cannot duplicate work. A DNS failure or a dial error
+// both mean no connection was ever established; anything later (a reset
+// mid-flight, a response-read timeout) is ambiguous.
+func neverReachedServer(err error) bool {
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return true
+	}
+	var opErr *net.OpError
+	return errors.As(err, &opErr) && opErr.Op == "dial"
+}
 
 // Client talks to the Speech Revolutions STT API.
 type Client struct {
@@ -567,13 +604,17 @@ func (c *Client) apiRequest(ctx context.Context, method, path string, body any, 
 		maxRetries = 0
 	}
 
+	// Job-creating calls retry only when the request provably never landed;
+	// anything else would risk a duplicate job and a duplicate charge.
+	creating := createsJob(path)
+
 	for attempt := 1; ; attempt++ {
 		status, header, respBody, err := c.doJSON(ctx, method, path, payload)
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			if attempt <= maxRetries {
+			if (!creating || neverReachedServer(err)) && attempt <= maxRetries {
 				if serr := sleepCtx(ctx, c.retryDelay(attempt, 0, false)); serr != nil {
 					return serr
 				}
@@ -582,7 +623,9 @@ func (c *Client) apiRequest(ctx context.Context, method, path string, body any, 
 			return apiErr(fmt.Sprintf("Cannot connect to %s: %v", c.BaseURL, err), 0, "")
 		}
 
-		if retryStatusCodes[status] && attempt <= maxRetries {
+		// For a create, only 429 is safe to retry: the server refused it
+		// outright, so no job exists. A 5xx may have created one before failing.
+		if retryStatusCodes[status] && attempt <= maxRetries && (!creating || status == 429) {
 			retryAfter, ok := parseRetryAfter(header.Get("Retry-After"))
 			if serr := sleepCtx(ctx, c.retryDelay(attempt, retryAfter, ok)); serr != nil {
 				return serr
