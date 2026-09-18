@@ -28,7 +28,17 @@ const (
 
 	sseMaxReconnects  = 10
 	sseReconnectDelay = 3 * time.Second
-	pollInterval      = 5 * time.Second
+
+	// How many times to retry a stream endpoint that answered with a NON-2xx
+	// status, as opposed to one whose connection dropped.
+	//
+	// The two look the same to the reconnect loop and are not the same thing.
+	// A drop is transient. A non-2xx is a refusal: a proxy or load balancer
+	// that does not pass text/event-stream answers every attempt identically,
+	// forever, so the full ladder just burns 30s before falling back to
+	// polling — on every job.
+	sseMaxStatusRefusals = 2
+	pollInterval         = 5 * time.Second
 
 	// Per-request deadlines, applied on top of the caller's context.
 	apiTimeout      = 30 * time.Second
@@ -102,6 +112,26 @@ type Client struct {
 // the single-shot path (server has multipart disabled, or a mid-flight failure).
 var errMultipartUnavailable = errors.New("multipart unavailable")
 
+// resolveBaseURL picks the API host: an explicit value, then the environment,
+// then production.
+//
+// Symmetric with the API key — if a caller can supply a key from the
+// environment, they can point it at an environment too. Needed for staging, for
+// an egress proxy or gateway, and for running any published example against
+// something that is not production.
+func resolveBaseURL(baseURL string) string {
+	if baseURL == "" {
+		baseURL = os.Getenv("SPEECHREVOLUTIONS_BASE_URL")
+	}
+	if baseURL == "" {
+		baseURL = os.Getenv("STT_BASE_URL")
+	}
+	if baseURL == "" {
+		return defaultBaseURL
+	}
+	return strings.TrimRight(baseURL, "/")
+}
+
 // NewClient creates a Client. If apiKey is empty, reads
 // SPEECHREVOLUTIONS_API_KEY or STT_API_KEY from the environment.
 func NewClient(apiKey string) (*Client, error) {
@@ -116,7 +146,7 @@ func NewClient(apiKey string) (*Client, error) {
 	}
 	return &Client{
 		APIKey:       apiKey,
-		BaseURL:      defaultBaseURL,
+		BaseURL:      resolveBaseURL(""),
 		Timeout:      600 * time.Second,
 		HTTP:         &http.Client{},
 		Multipart:    true,
@@ -746,6 +776,7 @@ func (c *Client) waitSSE(ctx context.Context, jobID, fallback string, onProgress
 	start := time.Now()
 	var lastEventID string
 	reconnects := 0
+	refusals := 0
 
 	for {
 		if time.Since(start) >= timeout {
@@ -775,6 +806,12 @@ func (c *Client) waitSSE(ctx context.Context, jobID, fallback string, onProgress
 			return url, nil
 		case "timeout":
 			return "", timeoutErr(fmt.Sprintf("Timed out after %s waiting for job %s", timeout, jobID))
+		case "refused":
+			refusals++
+			if refusals >= sseMaxStatusRefusals {
+				return "", nil // the endpoint will not stream; poll instead
+			}
+			reconnects++
 		case "reconnect":
 			reconnects++
 		}
@@ -828,7 +865,9 @@ func (c *Client) sseAttempt(
 		}}
 	case 200:
 	default:
-		return "reconnect", "", newLastID, nil
+		// A status, not a dropped connection: the endpoint answered and said
+		// no. Budgeted separately — see sseMaxStatusRefusals.
+		return "refused", "", newLastID, nil
 	}
 
 	scanner := bufio.NewScanner(resp.Body)
