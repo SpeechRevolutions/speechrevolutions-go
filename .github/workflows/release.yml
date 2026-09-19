@@ -1,0 +1,50 @@
+# Runs after a version tag is pushed. It cannot prevent a release — see ci.yml
+# for why — so its job is to tell you immediately if a tag went out that should
+# not have, and to make the version usable straight away.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: SpeechRevolutions/python-sdk
+          path: _mock
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: go vet ./...
+      - run: go test ./... -run '^Test[^L]'
+        env:
+          SR_MOCK_API: ${{ github.workspace }}/_mock/tests/mock_api.py
+      # Fetching through the proxy both warms the cache and proves the tag is
+      # actually resolvable by `go get` — the thing a reader will run.
+      - name: The tag must be fetchable by go get
+        run: |
+          cd "$(mktemp -d)"
+          go mod init verify >/dev/null
+          GOPROXY=https://proxy.golang.org go get \
+            github.com/speechrevolutions/go-sdk@${GITHUB_REF_NAME}
+          go list -m -versions github.com/speechrevolutions/go-sdk
+
+  github-release:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true

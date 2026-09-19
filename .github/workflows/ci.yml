@@ -1,0 +1,39 @@
+# Go has no registry: pushing a semver tag IS publishing, and proxy.golang.org
+# caches it permanently. A tag cannot be deleted, only retracted in a later
+# release.
+#
+# So unlike the other three SDKs, tests cannot gate the release — by the time a
+# tag-triggered job runs, the tag already exists and the proxy will serve it.
+# The gate has to sit earlier, which is what this is: main stays green, so
+# whatever commit gets tagged was already tested.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        go-version: ["1.21", "1.22", "1.23"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: SpeechRevolutions/python-sdk
+          path: _mock
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go-version }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: go vet ./...
+      # The functional suite drives the API mock from the python-sdk repo, the
+      # shared reference implementation every SDK tests against.
+      - run: go test ./... -run '^Test[^L]' -v
+        env:
+          SR_MOCK_API: ${{ github.workspace }}/_mock/tests/mock_api.py
