@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -139,7 +140,45 @@ func resolveBaseURL(baseURL string) string {
 // is also insurance: the edge answers a request with NO User-Agent with a
 // bare 403, which is how the C# client turned out to be unable to reach
 // production at all while passing every test pointed at a local mock.
-const userAgent = "speechrevolutions-go/0.2.0"
+// It is derived from the build info rather than written out, because a literal
+// drifts: the Python SDK served 0.2.2 from PyPI while announcing 0.2.0 on the
+// wire. A Go module's version is not compiled in as a constant, but the module
+// graph records it, and that is authoritative for a dependency.
+var userAgent = "speechrevolutions-go/" + sdkVersion()
+
+const modulePath = "github.com/speechrevolutions/speechrevolutions-go"
+
+// sdkVersion reports this module's version as the consumer's build resolved it.
+// It returns "0.0.0-dev" when there is nothing to read -- a `go run` of the
+// module itself, or a test binary -- which is honest rather than a stale number.
+func sdkVersion() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "0.0.0-dev"
+	}
+	if info.Main.Path == modulePath {
+		return normalizeVersion(info.Main.Version)
+	}
+	for _, dep := range info.Deps {
+		if dep.Path != modulePath {
+			continue
+		}
+		// A `replace` directive points somewhere else; report what is actually built.
+		if dep.Replace != nil {
+			return normalizeVersion(dep.Replace.Version)
+		}
+		return normalizeVersion(dep.Version)
+	}
+	return "0.0.0-dev"
+}
+
+func normalizeVersion(v string) string {
+	// "(devel)" is what the toolchain reports for an unversioned main module.
+	if v == "" || v == "(devel)" {
+		return "0.0.0-dev"
+	}
+	return strings.TrimPrefix(v, "v")
+}
 
 func NewClient(apiKey string) (*Client, error) {
 	if apiKey == "" {
