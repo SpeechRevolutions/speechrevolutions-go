@@ -5,11 +5,11 @@ Official Go client for the Speech Revolutions speech-to-text API.
 ## Install
 
 ```bash
-go get github.com/speechrevolutions/go-sdk
+go get github.com/speechrevolutions/speechrevolutions-go
 ```
 
 ```go
-import stt "github.com/speechrevolutions/go-sdk"
+import stt "github.com/speechrevolutions/speechrevolutions-go"
 ```
 
 ## Quick start

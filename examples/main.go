@@ -9,7 +9,7 @@ import (
 	"fmt"
 	"os"
 
-	stt "github.com/speechrevolutions/go-sdk"
+	stt "github.com/speechrevolutions/speechrevolutions-go"
 )
 
 func main() {

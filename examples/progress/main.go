@@ -10,7 +10,7 @@ import (
 	"os"
 	"sync"
 
-	stt "github.com/speechrevolutions/go-sdk"
+	stt "github.com/speechrevolutions/speechrevolutions-go"
 )
 
 // Weight the two phases into a single bar (upload is usually quick).
