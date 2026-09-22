@@ -1,7 +1,7 @@
 // Live progress for a web app: turn the SDK's two progress callbacks into one
 // 0–100 number you can store per job and serve to your frontend.
 //
-//	STT_API_KEY=stt_... go run ./progress
+//	SPEECHREVOLUTIONS_API_KEY=stt_... go run ./progress
 package main
 
 import (
@@ -42,9 +42,6 @@ func (p *jobProgress) snapshot() (string, float64) {
 
 func main() {
 	apiKey := os.Getenv("SPEECHREVOLUTIONS_API_KEY")
-	if apiKey == "" {
-		apiKey = os.Getenv("STT_API_KEY")
-	}
 	client, err := stt.NewClient(apiKey)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)

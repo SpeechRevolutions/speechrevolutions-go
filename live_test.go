@@ -33,7 +33,7 @@ func liveAPIClient(t *testing.T) *Client {
 	if os.Getenv("SR_LIVE") != "1" {
 		t.Skip("live API tests are opt-in: set SR_LIVE=1 (creates real, billable jobs)")
 	}
-	if os.Getenv("SPEECHREVOLUTIONS_API_KEY") == "" && os.Getenv("STT_API_KEY") == "" {
+	if os.Getenv("SPEECHREVOLUTIONS_API_KEY") == "" {
 		t.Skip("SPEECHREVOLUTIONS_API_KEY is not set")
 	}
 	c, err := NewClient("")

@@ -124,7 +124,6 @@ func audioBytes() []byte { return []byte(strings.Repeat("x", 4096)) }
 
 func TestResolveBaseURL(t *testing.T) {
 	t.Setenv("SPEECHREVOLUTIONS_BASE_URL", "")
-	t.Setenv("STT_BASE_URL", "")
 	if got := resolveBaseURL(""); got != defaultBaseURL {
 		t.Errorf("default = %q, want %q", got, defaultBaseURL)
 	}
@@ -140,10 +139,12 @@ func TestResolveBaseURL(t *testing.T) {
 		t.Errorf("explicit must win over env, got %q", got)
 	}
 
+	// STT_BASE_URL predates the rebrand; honouring it would let a stale
+	// variable silently point the client at the wrong host.
 	t.Setenv("SPEECHREVOLUTIONS_BASE_URL", "")
-	t.Setenv("STT_BASE_URL", "https://legacy.example")
-	if got := resolveBaseURL(""); got != "https://legacy.example" {
-		t.Errorf("legacy env = %q", got)
+	t.Setenv("STT_BASE_URL", "https://stale.example")
+	if got := resolveBaseURL(""); got != defaultBaseURL {
+		t.Errorf("pre-rebrand STT_BASE_URL must be ignored, got %q", got)
 	}
 }
 

@@ -4,7 +4,7 @@
 // result later by polling GetJobStatus / GetTranscript (or via a webhook set
 // through TranscribeOptions.CallbackURL).
 //
-//	STT_API_KEY=stt_... go run ./retrieve
+//	SPEECHREVOLUTIONS_API_KEY=stt_... go run ./retrieve
 package main
 
 import (
@@ -20,9 +20,6 @@ func main() {
 	ctx := context.Background()
 
 	apiKey := os.Getenv("SPEECHREVOLUTIONS_API_KEY")
-	if apiKey == "" {
-		apiKey = os.Getenv("STT_API_KEY")
-	}
 	client, err := stt.NewClient(apiKey)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)

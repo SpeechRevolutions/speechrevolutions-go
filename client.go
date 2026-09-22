@@ -125,16 +125,11 @@ func resolveBaseURL(baseURL string) string {
 		baseURL = os.Getenv("SPEECHREVOLUTIONS_BASE_URL")
 	}
 	if baseURL == "" {
-		baseURL = os.Getenv("STT_BASE_URL")
-	}
-	if baseURL == "" {
 		return defaultBaseURL
 	}
 	return strings.TrimRight(baseURL, "/")
 }
 
-// NewClient creates a Client. If apiKey is empty, reads
-// SPEECHREVOLUTIONS_API_KEY or STT_API_KEY from the environment.
 // userAgent identifies the SDK to the platform, which makes a client-side
 // problem findable in our edge logs without the caller reproducing it. It
 // is also insurance: the edge answers a request with NO User-Agent with a
@@ -180,15 +175,14 @@ func normalizeVersion(v string) string {
 	return strings.TrimPrefix(v, "v")
 }
 
+// NewClient creates a Client. If apiKey is empty, it reads
+// SPEECHREVOLUTIONS_API_KEY from the environment.
 func NewClient(apiKey string) (*Client, error) {
 	if apiKey == "" {
 		apiKey = os.Getenv("SPEECHREVOLUTIONS_API_KEY")
 	}
 	if apiKey == "" {
-		apiKey = os.Getenv("STT_API_KEY")
-	}
-	if apiKey == "" {
-		return nil, authErr("api_key is required (pass apiKey or set SPEECHREVOLUTIONS_API_KEY / STT_API_KEY)")
+		return nil, authErr("api_key is required (pass apiKey or set SPEECHREVOLUTIONS_API_KEY)")
 	}
 	return &Client{
 		APIKey:       apiKey,

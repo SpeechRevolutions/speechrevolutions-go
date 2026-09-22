@@ -15,7 +15,7 @@ import stt "github.com/speechrevolutions/speechrevolutions-go"
 ## Quick start
 
 ```go
-client, _ := stt.NewClient("") // SPEECHREVOLUTIONS_API_KEY or STT_API_KEY
+client, _ := stt.NewClient("") // reads SPEECHREVOLUTIONS_API_KEY
 ctx := context.Background()
 
 sl := true
@@ -177,8 +177,6 @@ client.HTTP = &http.Client{Transport: myTransport} // proxies, tracing, etc.
 
 ```bash
 export SPEECHREVOLUTIONS_API_KEY=stt_...
-# or
-export STT_API_KEY=stt_...
 ```
 
 ```go

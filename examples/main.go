@@ -13,13 +13,10 @@ import (
 )
 
 func main() {
-	// Reads the key from SPEECHREVOLUTIONS_API_KEY or STT_API_KEY.
+	// Reads the key from SPEECHREVOLUTIONS_API_KEY.
 	apiKey := os.Getenv("SPEECHREVOLUTIONS_API_KEY")
 	if apiKey == "" {
-		apiKey = os.Getenv("STT_API_KEY")
-	}
-	if apiKey == "" {
-		fmt.Fprintln(os.Stderr, "Set SPEECHREVOLUTIONS_API_KEY or STT_API_KEY.")
+		fmt.Fprintln(os.Stderr, "Set SPEECHREVOLUTIONS_API_KEY.")
 		os.Exit(1)
 	}
 
