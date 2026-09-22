@@ -42,14 +42,11 @@ callback (`nil` for none).
 ```go
 result, err := client.TranscribeURL(ctx, "https://example.com/audio.mp3", stt.TranscribeOptions{}, nil)
 // or, since Transcribe detects http(s):
-result, err := client.Transcribe(ctx, "https://example.com/audio.mp3", stt.TranscribeOptions{}, nil)
+// result, err := client.Transcribe(ctx, "https://example.com/audio.mp3", stt.TranscribeOptions{}, nil)
 ```
 
 The platform fetches the URL itself — the audio never passes through this
 process.
-
-```go
-```
 
 `TranscribeFile` is the same for a local path.
 
@@ -65,7 +62,7 @@ leave them `nil` to accept the default):
 | `SpeakerLabels` | `*bool` | `true` | label who spoke each segment |
 | `Diarize` | `*bool` | — | Deepgram-compatible alias for `SpeakerLabels` |
 | `NLTK` | `*bool` | `true` | restore punctuation & capitalization |
-| `Tier` | `*ProcessingTier` | `TierStandard` | `standard` \| `economy` |
+| `Tier` | `*ProcessingTier` | `TierStandard` | `standard` — the only tier currently available |
 | `CustomVocabulary` | `[]string` | `nil` | domain terms to bias toward |
 | `OnUploadProgress` | `ProgressFunc` | `nil` | upload byte-progress callback |
 | `Progress` | `bool` | `false` | render live console bars |
@@ -91,7 +88,7 @@ result, _ := client.Transcribe(ctx, "meeting.mp3", stt.TranscribeOptions{
 // 2. Programmatic — read ProgressEvent.Percent() (0–100) to drive your own UI.
 onProgress := func(e stt.ProgressEvent) { // transcription
     if pct, ok := e.Percent(); ok {
-        fmt.Printf("%.0f%% %s\n", pct, e.Step) // e.g. 42 "transcribe"
+        fmt.Printf("%.0f%% %s\n", pct, e.Step) // e.g. 50 "chunk:0"
     }
 }
 onUpload := func(e stt.ProgressEvent) { // upload (e.Step == "upload")
@@ -123,8 +120,10 @@ client.Transcribe(ctx, path, stt.TranscribeOptions{CallbackURL: "https://you.exa
 st, _ := client.GetJobStatus(ctx, jobID)     // st.Status: processing|completed|failed
 if st.IsCompleted() {
     result, _ := client.GetTranscript(ctx, jobID, stt.OutputJSON) // downloads + parses
+    fmt.Println(result.Text())
 }
 page, _ := client.ListJobs(ctx, 50, "")      // page.Jobs, page.NextBefore
+fmt.Println(len(page.Jobs), "recent jobs")
 ```
 
 ## Result shape
@@ -181,7 +180,7 @@ export SPEECHREVOLUTIONS_API_KEY=stt_...
 
 ```go
 client, _ := stt.NewClient("")          // reads the env vars above
-client, _ := stt.NewClient("stt_...")   // or pass it directly
+// client, _ := stt.NewClient("stt_...") // or pass it directly
 ```
 
 See [`examples/main.go`](examples/main.go) for a full run that shows progress
