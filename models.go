@@ -3,6 +3,7 @@ package stt
 import (
 	"encoding/json"
 	"os"
+	"sort"
 	"strings"
 )
 
@@ -294,17 +295,26 @@ func parseTranscript(jobID string, content []byte, outputType OutputType, downlo
 	return t
 }
 
-// utterancesFromDiarization prefers the server's diarization segments, which
-// separate turns the speaker labels alone cannot (the same speaker talking
-// twice). Falls back to grouping consecutive words by speaker.
+// utterancesFromDiarization builds speaker turns. They come from the words
+// whenever every word carries a speaker: each word lands in exactly one
+// utterance, and consecutive words from one speaker are one turn. Built from
+// the diarization segments instead, words that fell between segments were
+// silently dropped and every pause split a turn in two. Segments are only the
+// fallback, for words without speaker labels — sorted, because the service has
+// returned them grouped by speaker.
 func utterancesFromDiarization(words []Word, v any) []Utterance {
 	arr, ok := v.([]any)
-	if !ok || len(arr) == 0 {
+	if !ok || len(arr) == 0 || allWordsHaveSpeakers(words) {
 		return utterancesFromWords(words)
 	}
 
-	out := make([]Utterance, 0, len(arr))
-	for _, item := range arr {
+	sorted := append([]any(nil), arr...)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		return segStart(sorted[i]) < segStart(sorted[j])
+	})
+
+	out := make([]Utterance, 0, len(sorted))
+	for _, item := range sorted {
 		m, ok := item.(map[string]any)
 		if !ok {
 			continue
@@ -326,6 +336,27 @@ func utterancesFromDiarization(words []Word, v any) []Utterance {
 		return utterancesFromWords(words)
 	}
 	return out
+}
+
+func allWordsHaveSpeakers(words []Word) bool {
+	if len(words) == 0 {
+		return false
+	}
+	for _, w := range words {
+		if w.Speaker == "" {
+			return false
+		}
+	}
+	return true
+}
+
+func segStart(item any) float64 {
+	if m, ok := item.(map[string]any); ok {
+		if p := asFloatPtr(m["start"]); p != nil {
+			return *p
+		}
+	}
+	return 0
 }
 
 // wordsWithin collects the words a segment covers, falling back to a midpoint
