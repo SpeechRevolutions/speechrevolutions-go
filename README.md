@@ -1,6 +1,6 @@
-# go-sdk
+# Speech Revolutions — Go SDK
 
-Official Go client for the Speech Revolutions speech-to-text API.
+Official Go client for the [Speech Revolutions](https://www.speechrevolutions.com) speech-to-text API.
 
 ## Install
 
@@ -187,6 +187,11 @@ See [`examples/main.go`](examples/main.go) for a full run that shows progress
 and saves the result. Also see [`examples/retrieve`](examples/retrieve) for
 submit-and-poll, and [`examples/progress`](examples/progress) for wiring
 progress into a web app.
+
+## Links
+
+- [Speech Revolutions](https://www.speechrevolutions.com) — the speech-to-text API this library talks to
+- [Documentation](https://docs.speechrevolutions.com) — API reference, guides and quickstarts
 
 ## License
 
