@@ -43,6 +43,7 @@ func main() {
 			NLTK:             &nltk,
 			Tier:             &tier,
 			CustomVocabulary: nil,
+			Language:         "", // "" = auto-detect; e.g. "en" to pin English
 			OnUploadProgress: nil,
 			Progress:         true,
 		},

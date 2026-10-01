@@ -45,6 +45,14 @@ type TranscribeOptions struct {
 	NLTK             *bool
 	Tier             *ProcessingTier
 	CustomVocabulary []string
+	// Language pins the spoken language as an ISO 639-1 code from Whisper's
+	// set (e.g. "en", "ru"). Empty (or "auto") keeps automatic language
+	// detection. When set, detection is skipped and the whole job is
+	// transcribed in that language; pinning the wrong one makes the model
+	// translate into it (Russian audio pinned to "en" comes back as English).
+	// The code is passed through as-is: an unsupported one is rejected by the
+	// server with HTTP 422.
+	Language string
 	// CallbackURL, if set, is an http(s) webhook POSTed a signed
 	// completion/failure notification (X-SR-Signature: sha256=...).
 	CallbackURL string

@@ -64,6 +64,7 @@ leave them `nil` to accept the default):
 | `NLTK` | `*bool` | `true` | restore punctuation & capitalization |
 | `Tier` | `*ProcessingTier` | `TierStandard` | `standard` — the only tier currently available |
 | `CustomVocabulary` | `[]string` | `nil` | domain terms to bias toward |
+| `Language` | `string` | `""` (auto-detect) | ISO 639-1 code (e.g. `"en"`, `"ru"`) to skip language detection; a wrong code makes the model translate into it, an unsupported one returns HTTP 422 |
 | `OnUploadProgress` | `ProgressFunc` | `nil` | upload byte-progress callback |
 | `Progress` | `bool` | `false` | render live console bars |
 

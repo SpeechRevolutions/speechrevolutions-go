@@ -298,6 +298,7 @@ type uploadRequest struct {
 	NLTK             bool     `json:"nltk"`
 	Tier             string   `json:"tier"`
 	CustomVocabulary []string `json:"custom_vocabulary,omitempty"`
+	Language         string   `json:"language,omitempty"`
 	CallbackURL      string   `json:"callback_url,omitempty"`
 }
 
@@ -332,6 +333,7 @@ func uploadBody(fileSize int, opts TranscribeOptions) uploadRequest {
 		NLTK:             *opts.NLTK,
 		Tier:             string(*opts.Tier),
 		CustomVocabulary: opts.CustomVocabulary,
+		Language:         opts.Language,
 		CallbackURL:      opts.CallbackURL,
 	}
 }
