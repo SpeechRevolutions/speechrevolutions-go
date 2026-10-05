@@ -26,8 +26,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	// (Optional) submit a job whose completion is delivered to a webhook instead
-	// of waiting: client.Transcribe(ctx, path, stt.TranscribeOptions{CallbackURL: "https://..."}, nil)
+	// (Optional) have the finished job POSTed to a webhook instead of polling:
+	// client.Submit(ctx, "audio.mp3", stt.TranscribeOptions{CallbackURL: "https://you.example.com/hook"})
 
 	// 1. Fire-and-forget: Submit returns a job id immediately, without waiting.
 	jobID, err := client.Submit(ctx, "audio.mp3", stt.TranscribeOptions{})

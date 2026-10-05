@@ -545,22 +545,73 @@ func (c *Client) CompleteUpload(ctx context.Context, jobID string) error {
 }
 
 // WaitForResult waits via SSE (with polling fallback) and downloads the result.
+// When onProgress is set, a job that succeeds always ends with a 100% event
+// (Step "completed"), even when the service sent no progress at all — a short
+// file goes straight to one GPU chunk and streams none.
 func (c *Client) WaitForResult(ctx context.Context, jobID, downloadURL string, onProgress ProgressFunc) ([]byte, string, error) {
 	timeout := c.Timeout
 	if timeout <= 0 {
 		timeout = 600 * time.Second
 	}
 
-	url, err := c.waitSSE(ctx, jobID, downloadURL, onProgress, timeout)
+	tracker := &finalProgress{forward: onProgress}
+	url, err := c.waitSSE(ctx, jobID, downloadURL, tracker.callback(), timeout)
 	if err != nil {
 		return nil, "", err
 	}
+	var content []byte
 	if url == "" {
-		content, err := c.waitPoll(ctx, jobID, downloadURL, timeout)
-		return content, downloadURL, err
+		url = downloadURL
+		content, err = c.waitPoll(ctx, jobID, downloadURL, timeout)
+	} else {
+		content, err = c.DownloadResult(ctx, url)
 	}
-	content, err := c.DownloadResult(ctx, url)
-	return content, url, err
+	if err != nil {
+		return content, url, err
+	}
+	tracker.complete()
+	return content, url, nil
+}
+
+// finalProgress forwards progress events and remembers the last one, so that
+// complete can deliver a closing 100% event unless one was already delivered.
+type finalProgress struct {
+	forward ProgressFunc
+	start   time.Time
+	last    *ProgressEvent
+}
+
+func (f *finalProgress) callback() ProgressFunc {
+	if f.forward == nil {
+		return nil
+	}
+	f.start = time.Now()
+	return func(e ProgressEvent) {
+		f.last = &e
+		f.forward(e)
+	}
+}
+
+func (f *finalProgress) complete() {
+	if f.forward == nil {
+		return
+	}
+	total := 1
+	if f.last != nil {
+		if pct, ok := f.last.Percent(); ok && pct >= 100 {
+			return
+		}
+		if f.last.Total != nil && *f.last.Total > 0 {
+			total = *f.last.Total
+		}
+	}
+	done := total
+	f.forward(ProgressEvent{
+		Completed:      &done,
+		Total:          &total,
+		Step:           "completed",
+		ElapsedSeconds: time.Since(f.start).Seconds(),
+	})
 }
 
 // DownloadResult GETs the result bytes from a download URL.

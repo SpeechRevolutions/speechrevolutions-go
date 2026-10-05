@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -19,15 +20,17 @@ const (
 	OutputPDF  OutputType = "pdf"
 )
 
-// ProcessingTier selects pricing / scheduling.
+// ProcessingTier selects pricing / scheduling. TierStandard is the only tier
+// currently available; it is also the default.
 type ProcessingTier string
 
 const (
 	TierStandard ProcessingTier = "standard"
-	TierEconomy  ProcessingTier = "economy"
+	// TierEconomy is reserved for a future tier; today it is processed as
+	// standard.
+	TierEconomy ProcessingTier = "economy"
 )
 
-// TranscribeOptions controls how audio is transcribed.
 // Bool returns a pointer to b, for the optional *bool fields on
 // TranscribeOptions. Without it every call site needs a throwaway variable:
 //
@@ -37,6 +40,8 @@ func Bool(b bool) *bool { return &b }
 // Tier returns a pointer to t, for TranscribeOptions.Tier.
 func Tier(t ProcessingTier) *ProcessingTier { return &t }
 
+// TranscribeOptions controls how audio is transcribed. The zero value applies
+// every default.
 type TranscribeOptions struct {
 	OutputType       OutputType
 	WordTimestamps   *bool
@@ -243,24 +248,31 @@ type JobList struct {
 	NextBefore string       `json:"next_before,omitempty"`
 }
 
-// ToDeepgram returns a rough Deepgram pre-recorded response shape.
+// ToDeepgram returns a rough Deepgram pre-recorded response shape. Speakers
+// are 0-based integers, as Deepgram numbers them (SPEAKER_1 -> 0), on words
+// and on utterances alike.
 func (t Transcript) ToDeepgram() map[string]any {
 	dgWords := make([]map[string]any, 0, len(t.Words))
 	for _, w := range t.Words {
-		item := map[string]any{
-			"word":            strings.TrimRight(strings.ToLower(w.Word), ".,!?;:"),
-			"punctuated_word": w.Word,
+		dgWords = append(dgWords, deepgramWord(w))
+	}
+	utterances := make([]map[string]any, 0, len(t.Utterances))
+	for _, u := range t.Utterances {
+		words := make([]map[string]any, 0, len(u.Words))
+		for _, w := range u.Words {
+			words = append(words, deepgramWord(w))
 		}
-		if w.Start != nil {
-			item["start"] = *w.Start
+		utt := map[string]any{"transcript": u.Text, "channel": 0, "words": words}
+		if u.Start != nil {
+			utt["start"] = *u.Start
 		}
-		if w.End != nil {
-			item["end"] = *w.End
+		if u.End != nil {
+			utt["end"] = *u.End
 		}
-		if w.Speaker != "" {
-			item["speaker"] = w.Speaker
+		if u.Speaker != "" {
+			utt["speaker"] = deepgramSpeaker(u.Speaker)
 		}
-		dgWords = append(dgWords, item)
+		utterances = append(utterances, utt)
 	}
 	return map[string]any{
 		"metadata": map[string]any{"request_id": t.JobID, "channels": 1},
@@ -270,9 +282,41 @@ func (t Transcript) ToDeepgram() map[string]any {
 					{"transcript": t.Text(), "confidence": 1.0, "words": dgWords},
 				}},
 			},
-			"utterances": t.Utterances,
+			"utterances": utterances,
 		},
 	}
+}
+
+func deepgramWord(w Word) map[string]any {
+	item := map[string]any{
+		"word":            strings.TrimRight(strings.ToLower(w.Word), ".,!?;:"),
+		"punctuated_word": w.Word,
+	}
+	if w.Start != nil {
+		item["start"] = *w.Start
+	}
+	if w.End != nil {
+		item["end"] = *w.End
+	}
+	if w.Confidence != nil {
+		item["confidence"] = *w.Confidence
+	}
+	if w.Speaker != "" {
+		item["speaker"] = deepgramSpeaker(w.Speaker)
+	}
+	return item
+}
+
+// deepgramSpeaker maps our 1-based "SPEAKER_1" labels to Deepgram's 0-based
+// integer speaker (SPEAKER_1 -> 0). A label it does not recognise is returned
+// unchanged.
+func deepgramSpeaker(label string) any {
+	if rest, ok := strings.CutPrefix(strings.ToUpper(label), "SPEAKER_"); ok {
+		if n, err := strconv.Atoi(rest); err == nil && n >= 1 {
+			return n - 1
+		}
+	}
+	return label
 }
 
 // TranscriptResult is kept as an alias for backwards compatibility.

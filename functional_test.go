@@ -234,6 +234,36 @@ func TestProgressCallbackFires(t *testing.T) {
 	}
 }
 
+func TestProgressEndsAt100WhenServiceSendsNone(t *testing.T) {
+	// A short file goes straight to one GPU chunk and streams no progress;
+	// the caller still gets exactly one closing 100% event.
+	for _, tc := range []struct {
+		name  string
+		extra []string
+	}{
+		{"sse", []string{"--progress-steps", "0"}},
+		{"polling", []string{"--progress-steps", "0", "--stream-status", "503"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := startMock(t, tc.extra...)
+			var seen []ProgressEvent
+			_, err := liveClient(t, m.base).TranscribeBytes(
+				context.Background(), audioBytes(), TranscribeOptions{},
+				func(e ProgressEvent) { seen = append(seen, e) })
+			if err != nil {
+				t.Fatalf("transcribe: %v", err)
+			}
+			if len(seen) != 1 {
+				t.Fatalf("progress events = %d, want 1", len(seen))
+			}
+			pct, ok := seen[0].Percent()
+			if !ok || pct != 100 || seen[0].Step != "completed" {
+				t.Errorf("final event = %+v (pct %v), want 100%% step completed", seen[0], pct)
+			}
+		})
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Jobs API
 // ---------------------------------------------------------------------------

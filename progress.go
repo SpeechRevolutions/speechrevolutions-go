@@ -123,7 +123,9 @@ func humanBytes(n int) string {
 	if n < unit {
 		return fmt.Sprintf("%dB", n)
 	}
-	f := float64(n)
+	// n >= 1 KiB here, so divide once before choosing the unit: 270542 is
+	// 264.2KB, not 264.2MB.
+	f := float64(n) / unit
 	units := []string{"KB", "MB", "GB", "TB", "PB"}
 	i := 0
 	for f >= unit && i < len(units)-1 {

@@ -27,27 +27,23 @@ func main() {
 	}
 
 	// *bool / *ProcessingTier options are pointers so "unset" is distinct from
-	// false; take addresses of locals to set them explicitly.
-	wordTimestamps := true
-	speakerLabels := true
-	nltk := true
-	tier := stt.TierStandard
+	// false; stt.Bool and stt.Tier build them inline.
 
 	result, err := client.Transcribe(
 		context.Background(),
 		"audio.mp3",
 		stt.TranscribeOptions{
 			OutputType:       stt.OutputJSON,
-			WordTimestamps:   &wordTimestamps,
-			SpeakerLabels:    &speakerLabels, // alias: Diarize
-			NLTK:             &nltk,
-			Tier:             &tier,
+			WordTimestamps:   stt.Bool(true),
+			SpeakerLabels:    stt.Bool(true), // alias: Diarize
+			NLTK:             stt.Bool(true),
+			Tier:             stt.Tier(stt.TierStandard), // the only tier available today
 			CustomVocabulary: nil,
 			Language:         "", // "" = auto-detect; e.g. "en" to pin English
 			OnUploadProgress: nil,
 			Progress:         true,
 		},
-		nil, // called with transcription progress
+		nil, // or a func(stt.ProgressEvent) for transcription progress
 	)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)

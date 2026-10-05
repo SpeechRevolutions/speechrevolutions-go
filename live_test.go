@@ -134,9 +134,10 @@ func TestLiveBadKeyIsRejected(t *testing.T) {
 func TestLiveTranscribeFromPath(t *testing.T) {
 	c, ctx, audio := liveAPIClient(t), liveCtx(t), liveAudio(t)
 
+	var events []ProgressEvent
 	result, err := c.Transcribe(ctx, audio, TranscribeOptions{
 		SpeakerLabels: Bool(true),
-	}, nil)
+	}, func(e ProgressEvent) { events = append(events, e) })
 	if err != nil {
 		t.Fatalf("Transcribe: %v", err)
 	}
@@ -147,6 +148,14 @@ func TestLiveTranscribeFromPath(t *testing.T) {
 	if len(result.Words) == 0 {
 		t.Error("no words came back; WordTimestamps defaults to on")
 	}
+	// A short clip streams no progress of its own; the caller still sees 100%.
+	if len(events) == 0 {
+		t.Fatal("no progress events at all; a finished job must end with 100%")
+	}
+	if pct, ok := events[len(events)-1].Percent(); !ok || pct != 100 {
+		t.Errorf("last progress event = %+v, want 100%%", events[len(events)-1])
+	}
+	t.Logf("progress events: %d, last step %q", len(events), events[len(events)-1].Step)
 }
 
 // Live progress is a headline feature, so prove it actually arrives — but only
@@ -634,6 +643,23 @@ func TestLiveTranscriptTransforms(t *testing.T) {
 	dg := result.ToDeepgram()
 	if _, ok := dg["results"]; !ok {
 		t.Errorf("ToDeepgram has no results key: %v", keysOf(dg))
+	} else {
+		// Deepgram numbers speakers from 0; our SPEAKER_1 is its speaker 0.
+		utts, _ := dg["results"].(map[string]any)["utterances"].([]map[string]any)
+		if len(utts) == 0 {
+			t.Error("ToDeepgram has no utterances")
+		}
+		sawZero := false
+		for _, u := range utts {
+			n, ok := u["speaker"].(int)
+			if !ok || n < 0 {
+				t.Errorf("utterance speaker %v is not a 0-based int", u["speaker"])
+			}
+			sawZero = sawZero || n == 0
+		}
+		if !sawZero {
+			t.Error("no utterance is speaker 0")
+		}
 	}
 
 	dir := t.TempDir()
