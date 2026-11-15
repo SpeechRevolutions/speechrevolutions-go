@@ -61,6 +61,24 @@ type TranscribeOptions struct {
 	// CallbackURL, if set, is an http(s) webhook POSTed a signed
 	// completion/failure notification (X-SR-Signature: sha256=...).
 	CallbackURL string
+	// EndUserID is your own id for the person the audio belongs to; accounts
+	// with automatic vocabulary get that person's learned terms.
+	EndUserID string
+	// RedactPII replaces PII in the transcript (timings kept). RedactPIIPolicies
+	// narrows it (email_address, phone_number, credit_card_number,
+	// us_social_security_number, ip_address); RedactPIISub is "entity_name"
+	// (default) or "hash".
+	RedactPII         bool
+	RedactPIIPolicies []string
+	RedactPIISub      string
+	// EntityDetection adds `entities` to JSON output.
+	EntityDetection bool
+	// FilterProfanity masks profanity ("f***").
+	FilterProfanity bool
+	// Paragraphs adds `paragraphs` (speaker-aware, with sentences) to JSON output.
+	Paragraphs bool
+	// Verbatim keeps fillers and false starts; nil = the account's default.
+	Verbatim *bool
 
 	// OnUploadProgress, if set, is called with a ProgressEvent (Step == "upload")
 	// for every byte-level upload update. Read Percent() for a 0–100 value.

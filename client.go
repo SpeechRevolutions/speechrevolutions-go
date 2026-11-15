@@ -290,16 +290,24 @@ func (c *Client) SubmitBytes(ctx context.Context, data []byte, opts TranscribeOp
 }
 
 type uploadRequest struct {
-	FileSize         int      `json:"file_size,omitempty"`
-	AudioURL         string   `json:"audio_url,omitempty"`
-	OutputType       string   `json:"output_type"`
-	WordTimestamps   bool     `json:"word_timestamps"`
-	SpeakerLabels    bool     `json:"speaker_labels"`
-	NLTK             bool     `json:"nltk"`
-	Tier             string   `json:"tier"`
-	CustomVocabulary []string `json:"custom_vocabulary,omitempty"`
-	Language         string   `json:"language,omitempty"`
-	CallbackURL      string   `json:"callback_url,omitempty"`
+	FileSize          int      `json:"file_size,omitempty"`
+	AudioURL          string   `json:"audio_url,omitempty"`
+	OutputType        string   `json:"output_type"`
+	WordTimestamps    bool     `json:"word_timestamps"`
+	SpeakerLabels     bool     `json:"speaker_labels"`
+	NLTK              bool     `json:"nltk"`
+	Tier              string   `json:"tier"`
+	CustomVocabulary  []string `json:"custom_vocabulary,omitempty"`
+	Language          string   `json:"language,omitempty"`
+	CallbackURL       string   `json:"callback_url,omitempty"`
+	EndUserID         string   `json:"end_user_id,omitempty"`
+	RedactPII         bool     `json:"redact_pii,omitempty"`
+	RedactPIIPolicies []string `json:"redact_pii_policies,omitempty"`
+	RedactPIISub      string   `json:"redact_pii_sub,omitempty"`
+	EntityDetection   bool     `json:"entity_detection,omitempty"`
+	FilterProfanity   bool     `json:"filter_profanity,omitempty"`
+	Paragraphs        bool     `json:"paragraphs,omitempty"`
+	Verbatim          *bool    `json:"verbatim,omitempty"`
 }
 
 type uploadResponse struct {
@@ -325,7 +333,7 @@ type multipartCreateResponse struct {
 // uploadBody is the JSON shared by the single-shot and multipart create endpoints.
 func uploadBody(fileSize int, opts TranscribeOptions) uploadRequest {
 	opts = opts.withDefaults()
-	return uploadRequest{
+	body := uploadRequest{
 		FileSize:         fileSize,
 		OutputType:       string(opts.OutputType),
 		WordTimestamps:   *opts.WordTimestamps,
@@ -335,7 +343,18 @@ func uploadBody(fileSize int, opts TranscribeOptions) uploadRequest {
 		CustomVocabulary: opts.CustomVocabulary,
 		Language:         opts.Language,
 		CallbackURL:      opts.CallbackURL,
+		EndUserID:        opts.EndUserID,
+		RedactPII:        opts.RedactPII,
+		EntityDetection:  opts.EntityDetection,
+		FilterProfanity:  opts.FilterProfanity,
+		Paragraphs:       opts.Paragraphs,
+		Verbatim:         opts.Verbatim,
 	}
+	if opts.RedactPII {
+		body.RedactPIIPolicies = opts.RedactPIIPolicies
+		body.RedactPIISub = opts.RedactPIISub
+	}
+	return body
 }
 
 // submitURL registers a job the platform fetches itself, returning
@@ -655,6 +674,12 @@ func (c *Client) CheckFailed(ctx context.Context, jobIDs []string) ([]bool, erro
 }
 
 // GetJobStatus calls GET /api/v1/jobs/{id} for the current status (and a fresh
+// DeleteJob deletes a job's stored transcripts now (otherwise purged after
+// 24 h). The usage record is kept.
+func (c *Client) DeleteJob(ctx context.Context, jobID string) error {
+	return c.apiRequest(ctx, http.MethodDelete, "/api/v1/jobs/"+url.PathEscape(jobID), nil, nil)
+}
+
 // download URL once the job has completed).
 func (c *Client) GetJobStatus(ctx context.Context, jobID string) (*JobStatus, error) {
 	var st JobStatus
