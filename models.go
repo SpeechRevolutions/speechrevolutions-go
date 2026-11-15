@@ -77,6 +77,8 @@ type TranscribeOptions struct {
 	FilterProfanity bool
 	// Paragraphs adds `paragraphs` (speaker-aware, with sentences) to JSON output.
 	Paragraphs bool
+	// SpeakerNames adds `speaker_names` {"SPEAKER_1": "Alice"} to JSON output.
+	SpeakerNames bool
 	// Verbatim keeps fillers and false starts; nil = the account's default.
 	Verbatim *bool
 
