@@ -308,6 +308,8 @@ type uploadRequest struct {
 	FilterProfanity   bool     `json:"filter_profanity,omitempty"`
 	Paragraphs        bool     `json:"paragraphs,omitempty"`
 	SpeakerNames      bool     `json:"speaker_names,omitempty"`
+	Summarize         bool     `json:"summarize,omitempty"`
+	AutoChapters      bool     `json:"auto_chapters,omitempty"`
 	Verbatim          *bool    `json:"verbatim,omitempty"`
 }
 
@@ -350,6 +352,8 @@ func uploadBody(fileSize int, opts TranscribeOptions) uploadRequest {
 		FilterProfanity:  opts.FilterProfanity,
 		Paragraphs:       opts.Paragraphs,
 		SpeakerNames:     opts.SpeakerNames,
+		Summarize:        opts.Summarize,
+		AutoChapters:     opts.AutoChapters,
 		Verbatim:         opts.Verbatim,
 	}
 	if opts.RedactPII {

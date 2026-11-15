@@ -79,6 +79,9 @@ type TranscribeOptions struct {
 	Paragraphs bool
 	// SpeakerNames adds `speaker_names` {"SPEAKER_1": "Alice"} to JSON output.
 	SpeakerNames bool
+	// Summarize adds `summary` {text, bullets}; AutoChapters adds `chapters`.
+	Summarize    bool
+	AutoChapters bool
 	// Verbatim keeps fillers and false starts; nil = the account's default.
 	Verbatim *bool
 
