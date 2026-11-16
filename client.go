@@ -311,6 +311,8 @@ type uploadRequest struct {
 	Summarize         bool     `json:"summarize,omitempty"`
 	AutoChapters      bool     `json:"auto_chapters,omitempty"`
 	Verbatim          *bool    `json:"verbatim,omitempty"`
+	KeepRepeats       *bool    `json:"keep_repeats,omitempty"`
+	ConservativeVote  *bool    `json:"conservative_vote,omitempty"`
 }
 
 type uploadResponse struct {
@@ -355,6 +357,8 @@ func uploadBody(fileSize int, opts TranscribeOptions) uploadRequest {
 		Summarize:        opts.Summarize,
 		AutoChapters:     opts.AutoChapters,
 		Verbatim:         opts.Verbatim,
+		KeepRepeats:      opts.KeepRepeats,
+		ConservativeVote: opts.ConservativeVote,
 	}
 	if opts.RedactPII {
 		body.RedactPIIPolicies = opts.RedactPIIPolicies

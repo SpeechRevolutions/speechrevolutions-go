@@ -84,6 +84,12 @@ type TranscribeOptions struct {
 	AutoChapters bool
 	// Verbatim keeps fillers and false starts; nil = the account's default.
 	Verbatim *bool
+	// KeepRepeats keeps repeated words ("you know, you know") while still
+	// removing fillers; nil = follow Verbatim (or the account's default).
+	KeepRepeats *bool
+	// ConservativeVote favors the main model's reading of names when the
+	// models disagree; nil = the account's default (off).
+	ConservativeVote *bool
 
 	// OnUploadProgress, if set, is called with a ProgressEvent (Step == "upload")
 	// for every byte-level upload update. Read Percent() for a 0–100 value.
