@@ -82,16 +82,71 @@ leave them `nil` to accept the default, or set them with `stt.Bool(true)` /
 |-------|------|---------|-------|
 | `OutputType` | `OutputType` | `OutputJSON` | `txt` \| `json` \| `srt` \| `vtt` \| `docx` \| `pdf` |
 | `WordTimestamps` | `*bool` | `true` | per-word start/end times |
-| `SpeakerLabels` | `*bool` | `true` | label who spoke each segment |
+| `SpeakerLabels` | `*bool` | `false` | speaker diarization; add-on, +$0.02/hr |
 | `Diarize` | `*bool` | — | Deepgram-compatible alias for `SpeakerLabels` |
 | `NLTK` | `*bool` | `true` | restore punctuation & capitalization |
 | `Tier` | `*ProcessingTier` | `TierStandard` | `standard` — the only tier currently available |
-| `CustomVocabulary` | `[]string` | `nil` | domain terms to bias toward |
+| `CustomVocabulary` | `[]string` | `nil` | keyterms, given to the model and matched by sound; add-on, +$0.05/hr |
+| `Summarize` | `bool` | `false` | `result.Summary` (`Text`, `Bullets`); add-on, +$0.02/hr |
+| `FilterProfanity` | `bool` | `false` | strong profanity masked (`s***`); add-on, +$0.01/hr |
+| `Paragraphs` | `bool` | `false` | `result.Paragraphs`, speaker-aware with sentences; free |
+| `Verbatim` | `*bool` | server default | keep (true) or drop (false) fillers and false starts |
+| `Extra` | `map[string]any` | `nil` | any other API option, sent as given |
 | `Language` | `string` | `""` (auto-detect) | ISO 639-1 code (e.g. `"en"`, `"ru"`) to skip language detection; a wrong code makes the model translate into it, an unsupported one returns HTTP 422 |
 | `OnUploadProgress` | `ProgressFunc` | `nil` | upload byte-progress callback |
 | `Progress` | `bool` | `false` | render live console bars |
 
-An empty `TranscribeOptions{}` gets all defaults applied.
+An empty `TranscribeOptions{}` gets all defaults applied. Batch is $0.09 per audio hour; add-ons
+are charged per audio hour only when turned on. `client.DeleteJob(ctx, jobID)` deletes a job's
+transcripts before the automatic purge.
+
+## Real-time streaming
+
+Real-time transcription over WebSocket, $0.15 per session hour (early access). Audio is PCM16
+mono 16 kHz; `stt.LoadPCM16(path)` converts any file with ffmpeg.
+
+```go
+session, err := client.Stream(ctx, stt.StreamOptions{
+	Language:   "en", // or Languages: []string{"en", "ja"}, or empty to detect
+	Vocabulary: []string{"Northwind"},
+	OnEvent: func(e stt.StreamEvent) {
+		switch e.Type {
+		case "transcription.partial": // the open utterance so far; replaces the last partial
+			fmt.Printf("\r%s", e.Text)
+		case "final":
+			fmt.Printf("\n[%.2f-%.2f] %s\n", *e.Start, *e.End, e.Text)
+		}
+	},
+})
+if err != nil {
+	log.Fatal(err)
+}
+for chunk := range microphone() { // PCM16 mono 16 kHz, at the pace it's produced
+	session.SendAudio(chunk)
+}
+result, err := session.Finish(ctx) // waits for transcription.done
+fmt.Println(result.Text)
+```
+
+| Event | Fields |
+|---|---|
+| `session.created` | `JobID` |
+| `transcription.partial` | `Index`, `Text`, `Stable` (`Text[:Stable]` is settled), `AudioS` |
+| `final` | `Index`, `Text`, `Start`, `End` |
+| `final.revised` | `Index`, `Text`: a better version of an earlier final |
+| `speech.started` / `turn.ended` | `AudioS` / `Index`, `Start`, `End`, `Probability`, `Forced` |
+| `language.detected` | `Language`, `Index` |
+| `transcription.done` | `Text` |
+| `error` | `Code`, `Message` |
+
+- `TurnDetection: &stt.TurnDetection{Threshold: &t, MaxSilenceMs: &ms}` tunes when a turn ends;
+  `session.EndTurn()` ends one now (push-to-talk).
+- **Dropped connections are handled:** the session keeps unacknowledged audio, reconnects with
+  its job id for up to 60 s, and replays it. The result comes back complete under the same `JobID`.
+- `client.StreamFile(ctx, "call.mp3", opts)` streams a recording in real time (see
+  `examples/stream`). For recordings in production, `Transcribe` is faster and cheaper.
+- Audio must arrive in real time: the server takes at most about 10 seconds ahead of the clock.
+- Streaming uses `github.com/coder/websocket`, the SDK's one dependency (it has none of its own).
 
 ## Live progress
 
@@ -213,6 +268,7 @@ Default `OutputType` is `json`, parsed into a transcript-first object:
 | `result.TranscriptText()` | Deepgram alias |
 | `result.Words` | word + start/end/speaker |
 | `result.Utterances` | AssemblyAI speaker turns |
+| `result.Summary` / `result.Paragraphs` | set when requested |
 | `result.ToDeepgram()` | Deepgram-shaped map (0-based integer speakers) |
 | `result.ToDict()` | normalized map |
 | `result.Content` / `result.Save(path)` | raw bytes / write to file |

@@ -300,6 +300,29 @@ type uploadRequest struct {
 	CustomVocabulary []string `json:"custom_vocabulary,omitempty"`
 	Language         string   `json:"language,omitempty"`
 	CallbackURL      string   `json:"callback_url,omitempty"`
+	Summarize        bool     `json:"summarize,omitempty"`
+	FilterProfanity  bool     `json:"filter_profanity,omitempty"`
+	Paragraphs       bool     `json:"paragraphs,omitempty"`
+	Verbatim         *bool    `json:"verbatim,omitempty"`
+	// Extra is merged into the JSON body as given.
+	Extra map[string]any `json:"-"`
+}
+
+// MarshalJSON writes the typed fields, then Extra on top.
+func (r uploadRequest) MarshalJSON() ([]byte, error) {
+	type plain uploadRequest
+	b, err := json.Marshal(plain(r))
+	if err != nil || len(r.Extra) == 0 {
+		return b, err
+	}
+	m := map[string]any{}
+	if err := json.Unmarshal(b, &m); err != nil {
+		return nil, err
+	}
+	for k, v := range r.Extra {
+		m[k] = v
+	}
+	return json.Marshal(m)
 }
 
 type uploadResponse struct {
@@ -335,6 +358,11 @@ func uploadBody(fileSize int, opts TranscribeOptions) uploadRequest {
 		CustomVocabulary: opts.CustomVocabulary,
 		Language:         opts.Language,
 		CallbackURL:      opts.CallbackURL,
+		Summarize:        opts.Summarize,
+		FilterProfanity:  opts.FilterProfanity,
+		Paragraphs:       opts.Paragraphs,
+		Verbatim:         opts.Verbatim,
+		Extra:            opts.Extra,
 	}
 }
 
@@ -644,6 +672,13 @@ func (c *Client) CancelJob(ctx context.Context, jobID string) error {
 }
 
 // CheckFailed calls POST /api/v1/jobs/check-failed.
+// DeleteJob deletes a job's transcripts now instead of waiting for the
+// automatic purge. A running job is cancelled first, so nothing is written
+// after the delete.
+func (c *Client) DeleteJob(ctx context.Context, jobID string) error {
+	return c.apiRequest(ctx, http.MethodDelete, "/api/v1/jobs/"+url.PathEscape(jobID), nil, nil)
+}
+
 func (c *Client) CheckFailed(ctx context.Context, jobIDs []string) ([]bool, error) {
 	var resp struct {
 		FailedJobs []bool `json:"failed_jobs"`
@@ -833,6 +868,17 @@ func raiseForStatus(status int, header http.Header, body []byte) error {
 		return &RateLimitError{baseError: base, RetryAfter: retryAfter}
 	default:
 		base.Message = fmt.Sprintf("Unexpected response (HTTP %d)", status)
+		var detail struct {
+			Detail any `json:"detail"`
+		}
+		if json.Unmarshal(body, &detail) == nil && detail.Detail != nil {
+			// Say what the server said: "HTTP 503: Deletion is temporarily unavailable".
+			if s, ok := detail.Detail.(string); ok {
+				base.Message = fmt.Sprintf("HTTP %d: %s", status, s)
+			} else if b, err := json.Marshal(detail.Detail); err == nil {
+				base.Message = fmt.Sprintf("HTTP %d: %s", status, truncate(string(b), 300))
+			}
+		}
 		return &APIError{base}
 	}
 }

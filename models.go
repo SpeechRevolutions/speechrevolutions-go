@@ -43,8 +43,10 @@ func Tier(t ProcessingTier) *ProcessingTier { return &t }
 // TranscribeOptions controls how audio is transcribed. The zero value applies
 // every default.
 type TranscribeOptions struct {
-	OutputType       OutputType
-	WordTimestamps   *bool
+	OutputType     OutputType
+	WordTimestamps *bool
+	// SpeakerLabels turns on speaker diarization, an add-on (+$0.02 per audio
+	// hour). Off unless set.
 	SpeakerLabels    *bool
 	Diarize          *bool // alias for SpeakerLabels
 	NLTK             *bool
@@ -61,6 +63,20 @@ type TranscribeOptions struct {
 	// CallbackURL, if set, is an http(s) webhook POSTed a signed
 	// completion/failure notification (X-SR-Signature: sha256=...).
 	CallbackURL string
+	// Summarize adds a summary (Transcript.Summary). Add-on, +$0.02 per audio hour.
+	Summarize bool
+	// FilterProfanity masks strong profanity ("s***") in every output format.
+	// Add-on, +$0.01 per audio hour.
+	FilterProfanity bool
+	// Paragraphs adds speaker-aware paragraphs to the JSON output
+	// (Transcript.Paragraphs). Free.
+	Paragraphs bool
+	// Verbatim keeps (true) or drops (false) fillers and false starts. Nil
+	// leaves the server default.
+	Verbatim *bool
+	// Extra holds any other API option, sent as given (snake_case, as the API
+	// names it). For options newer than this SDK.
+	Extra map[string]any
 
 	// OnUploadProgress, if set, is called with a ProgressEvent (Step == "upload")
 	// for every byte-level upload update. Read Percent() for a 0–100 value.
@@ -84,7 +100,8 @@ func (o TranscribeOptions) withDefaults() TranscribeOptions {
 		out.SpeakerLabels = out.Diarize
 	}
 	if out.SpeakerLabels == nil {
-		out.SpeakerLabels = &t
+		f := false
+		out.SpeakerLabels = &f
 	}
 	if out.NLTK == nil {
 		out.NLTK = &t
@@ -172,8 +189,34 @@ type Transcript struct {
 	Words       []Word
 	Utterances  []Utterance
 	Languages   []LanguageSegment
-	Raw         map[string]any
-	text        string
+	// Summary is set when the request asked for Summarize.
+	Summary *Summary
+	// Paragraphs is set when the request asked for Paragraphs.
+	Paragraphs []Paragraph
+	Raw        map[string]any
+	text       string
+}
+
+// Summary is the Summarize add-on: a short summary and its key points.
+type Summary struct {
+	Text    string   `json:"text"`
+	Bullets []string `json:"bullets"`
+}
+
+// Sentence is one sentence of a Paragraph.
+type Sentence struct {
+	Text  string   `json:"text"`
+	Start *float64 `json:"start,omitempty"`
+	End   *float64 `json:"end,omitempty"`
+}
+
+// Paragraph is a speaker-aware paragraph: one speaker, split at long pauses.
+type Paragraph struct {
+	Text      string     `json:"text"`
+	Speaker   string     `json:"speaker,omitempty"`
+	Start     *float64   `json:"start,omitempty"`
+	End       *float64   `json:"end,omitempty"`
+	Sentences []Sentence `json:"sentences"`
 }
 
 // Text returns the full transcript (AssemblyAI / ElevenLabs-style).
@@ -343,8 +386,30 @@ func parseTranscript(jobID string, content []byte, outputType OutputType, downlo
 	t.Words = words
 	t.Utterances = utterancesFromDiarization(words, raw["diarization"])
 	t.Languages = parseLanguageSegments(raw["languages"])
+	t.Summary, t.Paragraphs = parseExtras(raw)
 	t.text = joinWords(words)
 	return t
+}
+
+// parseExtras reads the summary and paragraphs blocks by round-tripping them
+// through their typed structs.
+func parseExtras(raw map[string]any) (*Summary, []Paragraph) {
+	var summary *Summary
+	if v, ok := raw["summary"].(map[string]any); ok {
+		if b, err := json.Marshal(v); err == nil {
+			var s Summary
+			if json.Unmarshal(b, &s) == nil {
+				summary = &s
+			}
+		}
+	}
+	var paragraphs []Paragraph
+	if v, ok := raw["paragraphs"].([]any); ok {
+		if b, err := json.Marshal(v); err == nil {
+			_ = json.Unmarshal(b, &paragraphs)
+		}
+	}
+	return summary, paragraphs
 }
 
 // utterancesFromDiarization builds speaker turns. They come from the words
