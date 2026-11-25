@@ -65,7 +65,9 @@ func (e *StreamError) Error() string {
 // StreamEvent is one server event. Type is the protocol name: session.created, session.resumed,
 // transcription.partial (the open utterance so far; it replaces the previous partial of that
 // Index; Text[:Stable] is settled), final, final.revised, speech.started, turn.ended,
-// language.detected, language.unsupported, audio.committed, transcription.done, error.
+// language.detected, language.unsupported, audio.committed, transcription.done, voice_focus
+// (Active: the stream is locked to the voiceprint), warning, error. A redacted final whose PII
+// pass fell back to patterns only carries PIIStatus "patterns_only".
 type StreamEvent struct {
 	Type        string
 	Index       *int
@@ -80,7 +82,11 @@ type StreamEvent struct {
 	JobID       string
 	Code        string
 	Message     string
-	Raw         map[string]any
+	// Active is set on a voice_focus event: whether the stream is locked to the voiceprint.
+	Active *bool
+	// PIIStatus is "patterns_only" on a redacted final whose PII pass used pattern matching only.
+	PIIStatus string
+	Raw       map[string]any
 }
 
 // StreamFinal is one utterance's latest text.
@@ -100,6 +106,12 @@ type StreamResult struct {
 	Finals []StreamFinal
 	// Complete is false when the session ended before transcription.done.
 	Complete bool
+	// Voiceprint is set with CaptureVoiceprint: the sealed voiceprint to pass as
+	// StreamOptions.Voiceprint later.
+	Voiceprint string
+	// VoiceprintQuality is the captured voiceprint's quality ({"score", "ok", "reasons"});
+	// capture again until "ok" is true.
+	VoiceprintQuality map[string]any
 }
 
 // TurnDetection tunes when a turn ends.
@@ -120,6 +132,22 @@ type StreamOptions struct {
 	Vocabulary []string
 	// TurnDetection tunes when a turn ends.
 	TurnDetection *TurnDetection
+	// RedactPII redacts finals before they reach you (+$0.12 per session hour). Partials are not
+	// sent while it is on, unless IncludePartials is true, in which case they arrive unredacted.
+	RedactPII bool
+	// RedactPIIPolicies narrows the redacted types (see PIIPolicies). Sent only with RedactPII.
+	RedactPIIPolicies []string
+	// RedactPIISub is "entity_name" (the default) or "hash". Sent only with RedactPII.
+	RedactPIISub string
+	// IncludePartials, when set, asks for (true) or turns off (false) partials.
+	IncludePartials *bool
+	// Voiceprint locks the stream to one enrolled voice (voice focus, +$0.10 per session hour,
+	// billed only while a voice_focus event says it is active).
+	Voiceprint string
+	// CaptureVoiceprint enrols a voice: the result carries Voiceprint and VoiceprintQuality.
+	CaptureVoiceprint bool
+	// SpeakerPolicy is "prefer" or "strict", for Voiceprint.
+	SpeakerPolicy string
 	// OnEvent is called for every server event, from the session's reader goroutine. Don't block in it.
 	OnEvent func(StreamEvent)
 	// Extra holds other session.update fields, sent as given.
@@ -142,6 +170,27 @@ func (o StreamOptions) sessionUpdate() map[string]any {
 	}
 	if o.TurnDetection != nil {
 		m["turn_detection"] = o.TurnDetection
+	}
+	if o.RedactPII {
+		m["redact_pii"] = true
+		if len(o.RedactPIIPolicies) > 0 {
+			m["redact_pii_policies"] = o.RedactPIIPolicies
+		}
+		if o.RedactPIISub != "" {
+			m["redact_pii_sub"] = o.RedactPIISub
+		}
+	}
+	if o.IncludePartials != nil {
+		m["include_partials"] = *o.IncludePartials
+	}
+	if o.Voiceprint != "" {
+		m["voiceprint"] = o.Voiceprint
+	}
+	if o.CaptureVoiceprint {
+		m["capture_voiceprint"] = true
+	}
+	if o.SpeakerPolicy != "" {
+		m["speaker_policy"] = o.SpeakerPolicy
 	}
 	for k, v := range o.Extra {
 		m[k] = v
@@ -591,6 +640,10 @@ func parseStreamEvent(data []byte) (StreamEvent, bool) {
 	if v, ok := m["forced"].(bool); ok {
 		ev.Forced = &v
 	}
+	if v, ok := m["active"].(bool); ok {
+		ev.Active = &v
+	}
+	ev.PIIStatus = str("pii_status")
 	if e := str("error"); e != "" {
 		if ev.Message == "" {
 			ev.Message = e
@@ -748,7 +801,12 @@ func (s *LiveSession) result(complete bool) *StreamResult {
 	if s.done != nil {
 		text = s.done.Text
 	}
-	return &StreamResult{JobID: s.JobID, Text: text, Finals: finals, Complete: complete}
+	res := &StreamResult{JobID: s.JobID, Text: text, Finals: finals, Complete: complete}
+	if s.done != nil {
+		res.Voiceprint, _ = s.done.Raw["voiceprint"].(string)
+		res.VoiceprintQuality, _ = s.done.Raw["voiceprint_quality"].(map[string]any)
+	}
+	return res
 }
 
 // LoadPCM16 reads any audio file as PCM16 mono 16 kHz: directly if it already is that WAV,

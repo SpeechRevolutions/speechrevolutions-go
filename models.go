@@ -40,6 +40,13 @@ func Bool(b bool) *bool { return &b }
 // Tier returns a pointer to t, for TranscribeOptions.Tier.
 func Tier(t ProcessingTier) *ProcessingTier { return &t }
 
+// PIIPolicies are the types RedactPIIPolicies accepts (the server's list; the
+// default is all of them).
+var PIIPolicies = []string{
+	"person_name", "organization", "location", "address", "date_of_birth", "date", "account_number",
+	"email_address", "phone_number", "credit_card_number", "us_social_security_number", "ip_address",
+}
+
 // TranscribeOptions controls how audio is transcribed. The zero value applies
 // every default.
 type TranscribeOptions struct {
@@ -71,6 +78,28 @@ type TranscribeOptions struct {
 	// Paragraphs adds speaker-aware paragraphs to the JSON output
 	// (Transcript.Paragraphs). Free.
 	Paragraphs bool
+	// AutoChapters adds chapters covering the whole recording
+	// (Transcript.Chapters). Billed with summarization: +$0.02 per audio hour,
+	// once, with or without Summarize.
+	AutoChapters bool
+	// KnownSpeakers is speaker identification: the names or roles who may be
+	// speaking (up to 20). Each diarized speaker is matched to one, or left
+	// unnamed (Transcript.SpeakerNames). Needs SpeakerLabels. Add-on, +$0.02
+	// per audio hour.
+	KnownSpeakers []string
+	// RedactPII redacts PII in every output format: names, organisations,
+	// places, addresses, dates, account / card / phone / SSN / IP numbers.
+	// Add-on, +$0.08 per audio hour.
+	RedactPII bool
+	// RedactPIIPolicies narrows the redacted types (default all, see
+	// PIIPolicies). Sent only with RedactPII.
+	RedactPIIPolicies []string
+	// RedactPIISub is "entity_name" ("[PERSON_NAME]", the default) or "hash"
+	// ("####"). Sent only with RedactPII.
+	RedactPIISub string
+	// EntityDetection adds Transcript.Entities: the same types as RedactPII,
+	// typed and timed. Add-on, +$0.08 per audio hour.
+	EntityDetection bool
 	// Verbatim keeps (true) or drops (false) fillers and false starts. Nil
 	// leaves the server default.
 	Verbatim *bool
@@ -193,8 +222,36 @@ type Transcript struct {
 	Summary *Summary
 	// Paragraphs is set when the request asked for Paragraphs.
 	Paragraphs []Paragraph
-	Raw        map[string]any
-	text       string
+	// Chapters is set when the request asked for AutoChapters: sections
+	// covering the whole recording.
+	Chapters []Chapter
+	// Entities is set when the request asked for EntityDetection.
+	Entities []Entity
+	// SpeakerNames maps a speaker label to a name or role (KnownSpeakers);
+	// unnamed speakers are absent.
+	SpeakerNames map[string]string
+	// PIIStatus is "patterns_only" when PII redaction / entity detection could
+	// only use pattern matching (not charged).
+	PIIStatus string
+	Raw       map[string]any
+	text      string
+}
+
+// Chapter is one section of the recording (the AutoChapters option).
+type Chapter struct {
+	Start    *float64 `json:"start"`
+	End      *float64 `json:"end"`
+	Headline string   `json:"headline"`
+	Gist     string   `json:"gist"`
+}
+
+// Entity is one item found by EntityDetection. Text is its placeholder when
+// the transcript is also redacted.
+type Entity struct {
+	EntityType string   `json:"entity_type"`
+	Text       string   `json:"text"`
+	Start      *float64 `json:"start,omitempty"`
+	End        *float64 `json:"end,omitempty"`
 }
 
 // Summary is the Summarize add-on: a short summary and its key points.
@@ -260,6 +317,18 @@ func (t Transcript) ToDict() map[string]any {
 	}
 	if len(t.Languages) > 0 {
 		d["languages"] = t.Languages
+	}
+	if len(t.Chapters) > 0 {
+		d["chapters"] = t.Chapters
+	}
+	if len(t.Entities) > 0 {
+		d["entities"] = t.Entities
+	}
+	if len(t.SpeakerNames) > 0 {
+		d["speaker_names"] = t.SpeakerNames
+	}
+	if t.PIIStatus != "" {
+		d["pii_status"] = t.PIIStatus
 	}
 	return d
 }
@@ -387,6 +456,7 @@ func parseTranscript(jobID string, content []byte, outputType OutputType, downlo
 	t.Utterances = utterancesFromDiarization(words, raw["diarization"])
 	t.Languages = parseLanguageSegments(raw["languages"])
 	t.Summary, t.Paragraphs = parseExtras(raw)
+	t.Chapters, t.Entities, t.SpeakerNames, t.PIIStatus = parseAddons(raw)
 	t.text = joinWords(words)
 	return t
 }
@@ -410,6 +480,42 @@ func parseExtras(raw map[string]any) (*Summary, []Paragraph) {
 		}
 	}
 	return summary, paragraphs
+}
+
+// parseAddons reads the chapters, entities, speaker_names and pii_status
+// blocks. Malformed items are skipped rather than failing the transcript.
+func parseAddons(raw map[string]any) ([]Chapter, []Entity, map[string]string, string) {
+	var chapters []Chapter
+	if arr, ok := raw["chapters"].([]any); ok {
+		for _, item := range arr {
+			if m, ok := item.(map[string]any); ok {
+				chapters = append(chapters, Chapter{
+					Start: asFloatPtr(m["start"]), End: asFloatPtr(m["end"]),
+					Headline: asString(m["headline"]), Gist: asString(m["gist"]),
+				})
+			}
+		}
+	}
+	var entities []Entity
+	if arr, ok := raw["entities"].([]any); ok {
+		for _, item := range arr {
+			if m, ok := item.(map[string]any); ok {
+				entities = append(entities, Entity{
+					EntityType: asString(m["entity_type"]), Text: asString(m["text"]),
+					Start: asFloatPtr(m["start"]), End: asFloatPtr(m["end"]),
+				})
+			}
+		}
+	}
+	var names map[string]string
+	if m, ok := raw["speaker_names"].(map[string]any); ok && len(m) > 0 {
+		names = make(map[string]string, len(m))
+		for k, v := range m {
+			names[k] = asString(v)
+		}
+	}
+	status, _ := raw["pii_status"].(string)
+	return chapters, entities, names, status
 }
 
 // utterancesFromDiarization builds speaker turns. They come from the words

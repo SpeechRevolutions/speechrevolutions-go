@@ -303,7 +303,14 @@ type uploadRequest struct {
 	Summarize        bool     `json:"summarize,omitempty"`
 	FilterProfanity  bool     `json:"filter_profanity,omitempty"`
 	Paragraphs       bool     `json:"paragraphs,omitempty"`
-	Verbatim         *bool    `json:"verbatim,omitempty"`
+	AutoChapters     bool     `json:"auto_chapters,omitempty"`
+	KnownSpeakers    []string `json:"known_speakers,omitempty"`
+	RedactPII        bool     `json:"redact_pii,omitempty"`
+	// RedactPIIPolicies and RedactPIISub are only set when RedactPII is.
+	RedactPIIPolicies []string `json:"redact_pii_policies,omitempty"`
+	RedactPIISub      string   `json:"redact_pii_sub,omitempty"`
+	EntityDetection   bool     `json:"entity_detection,omitempty"`
+	Verbatim          *bool    `json:"verbatim,omitempty"`
 	// Extra is merged into the JSON body as given.
 	Extra map[string]any `json:"-"`
 }
@@ -348,7 +355,7 @@ type multipartCreateResponse struct {
 // uploadBody is the JSON shared by the single-shot and multipart create endpoints.
 func uploadBody(fileSize int, opts TranscribeOptions) uploadRequest {
 	opts = opts.withDefaults()
-	return uploadRequest{
+	r := uploadRequest{
 		FileSize:         fileSize,
 		OutputType:       string(opts.OutputType),
 		WordTimestamps:   *opts.WordTimestamps,
@@ -361,9 +368,18 @@ func uploadBody(fileSize int, opts TranscribeOptions) uploadRequest {
 		Summarize:        opts.Summarize,
 		FilterProfanity:  opts.FilterProfanity,
 		Paragraphs:       opts.Paragraphs,
+		AutoChapters:     opts.AutoChapters,
+		KnownSpeakers:    opts.KnownSpeakers,
+		RedactPII:        opts.RedactPII,
+		EntityDetection:  opts.EntityDetection,
 		Verbatim:         opts.Verbatim,
 		Extra:            opts.Extra,
 	}
+	if opts.RedactPII {
+		r.RedactPIIPolicies = opts.RedactPIIPolicies
+		r.RedactPIISub = opts.RedactPIISub
+	}
+	return r
 }
 
 // submitURL registers a job the platform fetches itself, returning
